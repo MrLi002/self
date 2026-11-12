@@ -1,0 +1,12 @@
+# PyTorch / torchvision are NOT listed here: install the CUDA build that matches your driver
+# first (setup_env.sh does this), e.g.
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+# Tested API requirements: torch >= 2.0 (pixel_unshuffle, meshgrid(indexing=...), unbatched conv2d),
+# torchvision with torchvision.ops.DeformConv2d (model/blocks.py).
+numpy>=1.23
+scipy>=1.9
+opencv-python>=4.6
+Pillow>=9.0
+matplotlib>=3.6
+tqdm>=4.64
+lpips==0.1.4

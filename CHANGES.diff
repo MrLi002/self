@@ -1,0 +1,2521 @@
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' "src/README_\346\224\271\345\212\250\350\257\264\346\230\216.md" "out/self/README_\346\224\271\345\212\250\350\257\264\346\230\216.md"
+--- "src/README_\346\224\271\345\212\250\350\257\264\346\230\216.md"	1969-12-31 18:00:00.000000000 -0600
++++ "out/self/README_\346\224\271\345\212\250\350\257\264\346\230\216.md"	2026-11-11 23:48:40.301930876 -0600
+@@ -0,0 +1,209 @@
++# 事件参考引导的光流插帧：代码评审与补全说明
++
++## 1. 方案是否合理
++
++整体思路是成立的，各步骤都有对应的已发表工作支撑：
++
++| 你的步骤 | 相近的已有做法 | 评价 |
++|---|---|---|
++| 用事件做 E2V，得到 t 时刻灰度图；用灰度 GT 监督 | DSER++ / Direct Synthesis 的事件参考帧 | 合理；可直接加载 DSER++ 的 `EventRecNet` 权重 |
++| 在 E2V 图与两端灰度帧之间建代价体，估计粗光流 | CBMNet 的"t 时刻锚特征 + 代价体" | 合理。区别是 CBMNet 的锚在特征域，你的锚在图像域。好处是可以复用 RAFT 预训练权重 |
++| 粗光流 + 事件 → 精修光流 | Time Lens / TimeReplayer 的残差细化 | 合理 |
++| 双向后向变形 + 选择性融合 | 常规做法 | 合理 |
++| 事件帧确定运动区域（DSER++ 的 HCS） | DSER++ | 合理，但阈值有问题，见 1.2 |
++| 沿光流从两端选择纹理（VTinker） | VTinker 纹理映射 | 合理；改成了可导的软选择 |
++
++### 1.1 需要特别注意的四个问题
++
++1. **光流方向写反了（必须改）。**
++   - `self.raft(gray_img0, pure_rec)` 得到的是 F_{0→t}，定义在 I₀ 的像素网格上。
++   - 用后向变形 `backwarp(I₀, F)` 生成 t 时刻的帧，需要的是定义在 t 网格上的 F_{t→0}，也就是 `RAFT(ref_t, gray0)`。
++   - 已改为一次 RAFT 调用、在 batch 维拼接两个方向，同时输出 F_{t→0} 和 F_{t→1}。
++2. **E2V 图只在事件掩码内可靠。**
++   - 重建损失是 `rec * mask` 对 `gray_gt * mask`，掩码外的输出完全不受约束。
++   - 纯事件本身也无法恢复绝对亮度，所以 E2V 图和真实灰度帧之间存在光度差。
++   - 代价体在无事件区域因此不可靠。已提供两种处理：
++     - 默认 `--ref-mode composite`：掩码内用 E2V 图，掩码外用两端灰度帧的均值（没有事件意味着亮度没有变化），掩码边界做平滑过渡；
++     - 可选 `--rec-use-frames`：把灰度 I₀ / I₁ 也输入 E2V，让它输出完整、亮度正确的参考图。注意开启后 E2V 第一层的通道数变化，不能再严格加载 DSER++ 的权重。
++3. **误差会传播。** E2V 的误差会依次影响代价体和光流。TimeTracker 对 TimeLens-XL 的批评"合成帧误差传播到光流"在这里同样适用。因此保留了：
++   - 事件残差细化；
++   - 对 RAFT 每次迭代输出和精修光流都施加光度损失（`--lambda-warp`）；
++   - 分阶段训练（见第 4 节）。
++4. **每个 t 都要重算光流。** 每个时刻要跑一次 RAFT（双向在 batch 维合并），属于"两段式"方法。多帧插值时成本随帧数线性增长。对 BS-ERGB 的 ×2 / ×4 没问题；如果以后要做 ×16 以上，需要考虑 OF-AF 那样的一次估计方案。
++
++### 1.2 关于 DSER++ HCS 掩码的两点发现
++
++- `pyramid_patch_mask` 的阈值是 **patch 内差值之和 ≥ beta**。32×32×3 的绝对差之和几乎总是远大于 0.1，所以 beta = 0.1 时，HCS 基本等于"含有事件的 patch"。
++  - 已新增 `--hcs-beta-mode mean`：改为与 patch 的平均差比较，阈值与 patch 大小无关。例如可以取 `--beta 0.05`。
++  - 默认仍为 `sum`，与 DSER++ 完全一致。`tools/smoke_test.py` 会对比验证两者的输出相同。
++- `mask_reverse` 只在两张掩码不同的位置交换。逐元素分析可知，这等价于**把两张掩码整体互换**。代码中按这个等价形式实现，并保留了注释。
++
++### 1.3 关于 VTinker
++
++- VTinker 用 2×2 纹理块、3×3 局部搜索，在两帧共 18 个候选中做**硬 argmax** 选择，这一步不可导。
++- 这里的实现改成 softmax 软注意力，并加入由遮挡图得到的可见性先验 log(vis)。
++- 候选纹理用精修后的 F_{t→k} 做后向变形对齐。纹理特征**只在 HCS 运动区域内**注入解码器。
++- VTinker 仓库的许可证（Pi-Lab 1.0）不是标准开源许可证，因此**没有复制它的代码**，`model/texture.py` 是按其算法思路独立实现的。
++
++---
++
++## 2. 原代码中的错误与修复
++
++| 位置 | 问题 | 修复 |
++|---|---|---|
++| `model/blocks.py` | 依赖的 `model/submodules.py` 缺失 | 按 DSER++（Apache-2.0）恢复，定义保持一致，并补上 `import torch`（blocks.py 依赖星号导入得到 `torch`） |
++| `model/ourNet.py` | `from raft import *` 路径错误 | 改为 `from model.raft import RAFT` 等 |
++| `model/raft.py`、`utils/corr.py` | `from utils.update ...` 是绝对路径，作为包导入时会失败 | 改成相对导入 `.utils...` |
++| `model/ourNet.py` | `RAFT()` 没有传 `args` | 新增 `default_raft_args()`，`RAFT(args=None)` 时使用默认配置 |
++| RAFT 输入 | 编码器要求 3 通道、取值 [0, 255]；灰度图是 1 通道、[0, 1] | 灰度复制成 3 通道；新增 `input_scale=1.0`，归一化后的范围与原版相同，预训练权重可直接使用 |
++| RAFT 输出 | 返回的是每次迭代结果组成的 list | 取最后一次作为粗光流，全部迭代用于序列光度损失 |
++| RAFT 的 BatchNorm | batch = 1 时统计量无意义 | 训练时冻结 BN（与 RAFT 官方微调一致），可用 `--no-freeze-raft-bn` 关闭 |
++| 光流方向 | 见 1.1 第 1 条 | 改为 F_{t→0} / F_{t→1} |
++| `args.stage` | 训练脚本没有这个参数，会报 AttributeError | 新增 `--stage {rec, flow, full}` |
++| `util/voxelization.py` | `np.reshape(newshape=...)` 在 NumPy ≥ 2.1 已移除，**会导致数据加载崩溃** | 改成 tensor 的 `.reshape` |
++| `util/*.py` | `np.int` / `np.bool` 在新版 NumPy 中已移除 | 改为 `int` / `bool` |
++| LPIPS | 输入是 OpenCV 的 BGR 顺序，而 LPIPS 按 RGB 训练 | 计算前交换通道 |
++| 未使用的模块 | `encoder_f / encoder_e / encoder_ref` 没有被调用 | 删除；同类编码器在纹理模块和解码器中重新使用 |
++
++---
++
++## 3. 补全后的数据流
++
++输入：`imgs` (B, 9, H, W)，为 BGR、[0, 1]，其中中间 3 个通道是 GT，前向时不使用；`voxels` = [E₀→t, E_t→1, E₁→t]；`mask` 为事件掩码；`t` 为归一化目标时刻。
++
++```text
++v0t, vt1 ──► EventRecNet ──► pure_rec (B,1,H,W) ──×mask──► rec           [L_rec: 灰度GT*mask, L1+LPIPS]
++                                │
++            composite: soft(mask)·rec + (1-soft)·(g0+g1)/2 = ref_t
++                                │
++ref_t ↔ gray(I0), gray(I1) ──► RAFT (双向在 batch 维合并) ──► F_t→0^c, F_t→1^c   [L_warp: 每次迭代, γ=0.8]
++                                │
++E_t→0 = reverse_voxel(v0t), E_t→1 = vt1
++coarse F + warp(I_k) + ref + |err| + E_t→k + mask ──► EventFlowRefiner (两方向共享权重)
++                                │                   ──► F_t→k (精修), occ_k
++backwarp(I0,F_t→0)=W0, backwarp(I1,F_t→1)=W1 ──► SelectiveFusion (DenseBlock→M)
++                                │                   ──► coarse = M·W0 + (1-M)·W1   [L_syn, L_warp(min)]
++coarse vs I0 / I1 + 事件 patch ──► HCS 掩码 (DSER++) ──► hcs_union (full / 1/2 / 1/4)
++                                │
++I0, I1 特征沿 F_t→k 后向变形 ──► 3×3 局部搜索 × 2 帧 = 18 个候选，软选择 2×2 纹理块
++                                │                   ──► texture (1/2 分辨率, 只在 HCS 内注入)
++coarse + W0 + W1 + 事件特征 + texture ──► TextureRefineDecoder ──► [pred_full, pred_half, pred_quarter]
++                                                         [L_ref: 多尺度 L1 + LPIPS;  L_ps: HCS 内的 SSIM]
++```
++
++`forward` 返回值与 DSER++ 保持相同的 6 元组：
++`(pure_rec_3ch, rec_3ch, coarse, predictions, hcs_union, aux)`。`aux` 中包含粗光流和精修光流、遮挡图、两张变形帧、融合掩码、HCS 等，便于可视化。`stage == "rec"` 时只返回前两项。
++
++### 新增 / 修改的文件
++
++- `model/submodules.py`（恢复）
++- `model/__init__.py`（新增，空文件）
++- `model/warp.py`（新增）：后向变形、光流缩放、voxel 时间反转、边缘感知平滑
++- `model/flow_modules.py`（新增）：`CoarseFlowEstimator`（RAFT 封装，可加载 raft-things.pth）、`EventFlowRefiner`、`SelectiveFusion`
++- `model/texture.py`（新增）：`hcs_patch_masks`、`FlowGuidedTextureMapper`、`TextureRefineDecoder`
++- `model/ourNet.py`（补全）
++- `model/raft.py`、`model/utils/corr.py`、`model/utils/utils.py`（修复导入和参数）
++- `train_bsergb.py`：新增分阶段训练、光度 / 平滑损失、分组学习率、冻结选项，并把 `t` 传入网络
++- `datasets/bsergb.py`：返回值中新增 `t`
++- `model/ourModel.py`：`inference(..., t=None)`
++- `util/voxelization.py`、`util/event.py`、`util/utils_func.py`：NumPy 兼容性修复
++- `tools/smoke_test.py`（新增）
++
++---
++
++## 4. 训练流程（建议分三个阶段）
++
++```bash
++# 0) 先跑冒烟测试（CPU 即可，不需要任何权重）
++python tools/smoke_test.py
++
++# 1) E2V 阶段（如果已有 DSER++ 的权重，可以跳过，见下方说明）
++python train_bsergb.py --data-root /path/BSERGB/3_TRAINING --stage rec --epochs 20 --output-dir train/rec
++
++# 2) 光流阶段：加载阶段 1 的权重和 RAFT 官方权重，冻结 E2V
++python train_bsergb.py --data-root ... --stage flow \
++    --pretrained train/rec/last.pth --raft-ckpt raft-things.pth --freeze-rec \
++    --epochs 20 --output-dir train/flow
++
++# 3) 端到端阶段
++python train_bsergb.py --data-root ... --stage full --pretrained train/flow/last.pth \
++    --raft-lr-mult 0.1 --rec-lr-mult 0.1 --epochs 40 --output-dir train/full
++```
++
++- RAFT 权重使用官方的 `raft-things.pth`（princeton-vl/RAFT）。所有阶段的网络结构完全相同，因此可以用 `--pretrained` 严格加载上一阶段的权重。`--raft-ckpt` 在 `--pretrained` 之后加载，不会被阶段 1 中未训练的 RAFT 权重覆盖。
++- 用 DSER++ 的权重初始化 E2V：`--pretrained dser.pth --allow-partial-pretrained`。这只会加载 `event_rec.*`，其余键会被忽略。
++- `--resume` 时请保持冻结相关参数不变，因为参数分组需要一致。
++
++---
++
++## 5. 未在本环境验证的部分（请先确认）
++
++- 本次的运行环境无法安装 PyTorch（软件包源被网络策略拦截）。因此只做了语法编译和跨模块导入的静态检查，**没有实际运行前向和反向传播**。请先在你的环境中运行 `python tools/smoke_test.py`。它会检查：
++  - 后向变形的光流方向约定；
++  - `reverse_voxel` 与对反转事件流做体素化的结果是否一致；
++  - HCS 掩码与 DSER++ 原实现是否逐元素相同；
++  - 三个阶段的前向、反向传播和输出形状；
++  - 任意尺寸输入时的 padding / unpad。
++- 超参数（`flow_norm = 20`、细化网络通道数、`texture_window = 3`、各损失权重）都是经验初值，没有调参。
++- 显存：训练时 256 的裁剪尺寸没有问题。全分辨率推理（970×625，padding 到 1024×640）时，RAFT 的全对相关体大约需要 1 GB 量级的显存。
++
++## 6. 建议的消融实验
++
++- 参考图：`--ref-mode rec` vs `composite`，以及加不加 `--rec-use-frames`。
++- 有无事件细化：`--refine-iters 0`（直接使用 RAFT 的粗光流，遮挡 logit 为 0）。
++- 有无纹理模块：用 `stage flow` 的结果作为对照。
++- HCS 阈值：`--hcs-beta-mode sum --beta 0.1`（DSER++ 原设置）vs `mean --beta 0.03 / 0.05`。
++- `--detach-rec-for-flow`：E2V 是否接收来自光流和合成损失的梯度。
++
++---
++
++## 7. 多目标训练：skip=3 的窗口一次生成 3 张（新增）
++
++**数据**（`datasets/bsergb.py`，默认 `--target-mode all`）
++
++- 每个 skip=N 窗口是一个样本，返回全部 N 个中间时刻：
++  - `endpoints` (6,H,W)
++  - `gts` (K,3,H,W)
++  - `voxels` (K,3·bins,H,W)
++  - `masks` (K,1,H,W)
++  - `t` (K,)
++
++  其中 K = N，按时间升序排列。skip=3 时 t = 0.25 / 0.5 / 0.75。
++- 窗口内每个区间的事件文件只读一次，再按各目标帧的位置切分成 E₀→t / E_t→1。同一窗口的所有目标共用同一个随机裁剪和同一套数据增强。
++- `--target-mode random`：恢复旧行为，每次只随机选一个目标（K=1）。
++- `SkipGroupedBatchSampler`：保证同一个 batch 内的窗口 K 相同（skip=1 与 skip=3 不混在一起），batch 的顺序每个 epoch 重新打乱。batch_size=1 时等价于普通的随机打乱。
++
++**训练**（`train_bsergb.py`）
++
++- `flatten_targets` 把 (B, K, …) 展开成 (B·K, …)，仍然拼成 `[I₀, GT_t, I₁]` 的 9 通道输入，所以 `MyNet` 和原有损失函数都不需要改。一次前向就得到 K 个结果：
++  - 第一阶段：K 张 E2V 灰度图；
++  - 第二阶段：K 张粗插帧结果；
++  - 第三阶段：K 张最终预测。
++- `--target-weighting window`（默认）：每个窗口权重相同，损失先对 K 个目标求平均。`frame`：每一帧权重相同，skip=3 窗口的权重是 skip=1 的 3 倍。
++- `--lambda-tc`：同一窗口内相邻目标帧之间的时间一致性损失，|(P_{k+1} − P_k) − (G_{k+1} − G_k)|。它不依赖光流，惩罚误差随时间跳变（闪烁）。第一阶段在两帧的事件掩码交集内计算，第二阶段用粗插帧结果，第三阶段用最终预测。K = 1 时自动为 0。代码默认值为 0，`train_model.sh` 中设为 0.1。
++- 进度条改为显示各项损失的**均值**（原来显示的是累加和）；每个 epoch 结束时打印窗口数和目标帧数。
++
++**推理**：新增 `Model.inference_window(endpoints, voxels, masks, t, chunk=None)`，一次返回一个窗口的全部 K 帧，形状为 (B,K,3,H,W)。显存不够时可以用 `chunk` 分批计算。
++
++**代价**：K 个目标目前直接展开到 batch 维计算，两端帧相关的计算没有在目标之间共享。所以一个 skip=3 窗口的计算量和显存约为 skip=1 的 3 倍（RAFT 的等效 batch 为 2K）。如果显存不足，可以减小 `--crop-size` 或 `--raft-iters`。
++
++---
++
++## 8. 环境配置
++
++```bash
++bash setup_env.sh                                   # 默认：conda 环境 evfi、Python 3.10、torch 2.5.1 + CUDA 12.1
++CUDA_TAG=cu118 bash setup_env.sh                    # nvidia-smi 显示的 CUDA Version 低于 12.1 时
++PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple bash setup_env.sh   # 普通依赖走国内镜像
++conda activate evfi && python tools/check_env.py    # 之后随时可以重新检查环境
++```
++
++- `requirements.txt` 不包含 torch 和 torchvision，因为这两个包必须按显卡驱动选择对应的 CUDA 版本，由 `setup_env.sh` 单独安装。CUDA_TAG 不能高于 nvidia-smi 右上角显示的 CUDA Version。
++- RAFT 权重会自动下载到 `checkpoints/raft-things.pth`，使用的是 RAFT 官方 download_models.sh 中的 Dropbox 链接。如果下载失败，请手动从 RAFT README 提供的 Google Drive 下载，再放到这个位置。
++- `tools/check_env.py` 会检查以下内容：
++  - 各依赖库的版本，以及 CUDA 和显卡信息；
++  - 代码依赖的几个 API：DeformConv2d、pixel_unshuffle、无 batch 维的 conv2d；
++  - 项目各模块能否正常导入；
++  - NumPy 兼容性；
++  - LPIPS 权重是否可用；
++  - RAFT 权重能否严格加载进项目里的 RAFT。
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/datasets/__init__.py out/self/datasets/__init__.py
+--- src/datasets/__init__.py	2026-10-08 18:17:20.000000000 -0500
++++ out/self/datasets/__init__.py	2026-11-11 23:21:35.077982790 -0600
+@@ -1,5 +1,5 @@
+ """Dataset builders used by the training entry points."""
+ 
+-from .bsergb import BSERGBTrainDataset, build_bsergb_train_dataset
++from .bsergb import TARGET_MODES, BSERGBTrainDataset, SkipGroupedBatchSampler, build_bsergb_train_dataset
+ 
+-__all__ = ["BSERGBTrainDataset", "build_bsergb_train_dataset"]
++__all__ = ["TARGET_MODES", "BSERGBTrainDataset", "SkipGroupedBatchSampler", "build_bsergb_train_dataset"]
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/datasets/bsergb.py out/self/datasets/bsergb.py
+--- src/datasets/bsergb.py	2026-11-12 11:05:58.000000000 -0600
++++ out/self/datasets/bsergb.py	2026-11-11 23:21:26.381982273 -0600
+@@ -1,23 +1,43 @@
+-"""BS-ERGB training data loader for DSER++.
++"""BS-ERGB training data loader.
+ 
+ The BS-ERGB release stores one RGB image per timestamp and one event file for
+-each adjacent image interval. DSER++ predicts one target timestamp per forward
+-pass, so every skip-N window contributes one training sample. Its target is
+-sampled uniformly from the N intermediate frames each time the window is read.
+-For example, skip=3 with endpoints (0, 4) randomly targets frame 1, 2, or 3.
++each adjacent image interval. Every skip-N window (endpoints ``start`` and
++``end = start + N + 1``) is one training sample.
++
++``target_mode="all"`` (default): a window returns **all N intermediate frames**
++as targets, e.g. skip=3 with endpoints (0, 4) returns targets 1, 2 and 3 together
++with one event split per target. The network is then run on the K = N targets of
++the window (they are flattened into the batch dimension by the training script),
++so stage 1 reconstructs K gray images and stages 2/3 predict K frames.
++
++``target_mode="random"``: the previous behaviour, one randomly chosen target per
++read (K = 1).
++
++Every sample is a dict with K = number of targets::
++
++    endpoints : (6, H, W)          I_0 and I_1, OpenCV BGR in [0, 1]
++    gts       : (K, 3, H, W)       ground-truth intermediate frames (ascending time)
++    voxels    : (K, 3*bins, H, W)  per target [E_0->t, E_t->1, E_1->t]
++    masks     : (K, 1, H, W)       per target event mask
++    t         : (K,)               normalised target times (target-start)/(end-start)
++
++Windows with different K cannot be stacked into one batch; use
++``SkipGroupedBatchSampler`` when batch_size > 1.
+ """
+ 
+ from __future__ import annotations
+ 
++import math
+ import os
+ import random
++from collections import defaultdict
+ from pathlib import Path
+-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
++from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+ 
+ import cv2
+ import numpy as np
+ import torch
+-from torch.utils.data import Dataset
++from torch.utils.data import Dataset, Sampler
+ 
+ from util.event import EventSequence, load_events
+ from util.utils_func import events_to_channels, process_mask
+@@ -26,6 +46,7 @@
+ 
+ CropBox = Tuple[int, int, int, int]
+ WindowIndex = Tuple[int, int, int, int]
++TARGET_MODES = ("all", "random")
+ 
+ 
+ def _natural_name_key(path: Path) -> Tuple[object, ...]:
+@@ -54,47 +75,41 @@
+     )
+ 
+ 
+-def _load_sequence(
+-    paths: Sequence[Path],
+-    height: int,
+-    width: int,
+-    crop_box: CropBox,
+-) -> Optional[EventSequence]:
+-    """Load, crop, and concatenate an interval of BS-ERGB event files."""
++def _load_event_chunks(paths: Sequence[Path], crop_box: CropBox) -> List[np.ndarray]:
++    """Load and crop each interval file once (one array per adjacent-frame interval)."""
++    return [load_events(str(path), bsergb=True, size=crop_box) for path in paths]
+ 
+-    feature_chunks: List[np.ndarray] = []
+-    for path in paths:
+-        features = load_events(str(path), bsergb=True, size=crop_box)
+-        if features.size:
+-            feature_chunks.append(features)
+ 
+-    if not feature_chunks:
++def _sequence_from_chunks(chunks: Sequence[np.ndarray], height: int, width: int) -> Optional[EventSequence]:
++    """Concatenate interval chunks into one time-sorted EventSequence (None if empty)."""
++    non_empty = [chunk for chunk in chunks if chunk.size]
++    if not non_empty:
+         return None
+-
+-    features = np.concatenate(feature_chunks, axis=0)
++    features = np.concatenate(non_empty, axis=0)  # always a fresh copy
+     if features.shape[0] > 1 and np.any(np.diff(features[:, 2]) < 0):
+         features = features[np.argsort(features[:, 2], kind="stable")]
+     return EventSequence(features, height, width)
+ 
+ 
+-def _voxel_or_zeros(
+-    sequence: Optional[EventSequence], bins: int, height: int, width: int
+-) -> torch.Tensor:
++def _load_sequence(paths: Sequence[Path], height: int, width: int, crop_box: CropBox) -> Optional[EventSequence]:
++    """Load, crop, and concatenate an interval of BS-ERGB event files."""
++    return _sequence_from_chunks(_load_event_chunks(paths, crop_box), height, width)
++
++
++def _voxel_or_zeros(sequence: Optional[EventSequence], bins: int, height: int, width: int) -> torch.Tensor:
+     if sequence is None or len(sequence) == 0 or sequence.duration() <= 0:
+         return torch.zeros((bins, height, width), dtype=torch.float32)
+     return to_voxel_grid(sequence, bins)
+ 
+ 
+-def _event_channels_or_zeros(
+-    sequence: Optional[EventSequence], height: int, width: int
+-) -> torch.Tensor:
++def _event_channels_or_zeros(sequence: Optional[EventSequence], height: int, width: int) -> torch.Tensor:
+     if sequence is None or len(sequence) == 0:
+         return torch.zeros((2, height, width), dtype=torch.float32)
+     return events_to_channels(sequence).float()
+ 
+ 
+ class BSERGBTrainDataset(Dataset):
+-    """Create one randomly targeted sample per BS-ERGB temporal window.
++    """One sample per BS-ERGB temporal window, with all (or one random) targets.
+ 
+     Expected layout::
+ 
+@@ -117,6 +132,7 @@
+         augment: bool = True,
+         rotate: bool = True,
+         excluded_frame_indices: Optional[Dict[str, Sequence[int]]] = None,
++        target_mode: str = "all",
+     ) -> None:
+         super().__init__()
+         self.data_root = Path(data_root).expanduser().resolve()
+@@ -124,6 +140,7 @@
+         self.skips = tuple(sorted({int(skip) for skip in skips}))
+         self.augment = bool(augment)
+         self.rotate = bool(rotate)
++        self.target_mode = str(target_mode)
+         self.excluded_frame_indices = {
+             key: set(value) for key, value in (excluded_frame_indices or {}).items()
+         }
+@@ -135,6 +152,8 @@
+                 raise ValueError("crop_size must be an int or a two-element sequence")
+             self.crop_height, self.crop_width = map(int, crop_size)
+ 
++        if self.target_mode not in TARGET_MODES:
++            raise ValueError(f"target_mode must be one of {TARGET_MODES}")
+         if self.bins <= 0:
+             raise ValueError("bins must be positive")
+         if not self.skips or any(skip <= 0 for skip in self.skips):
+@@ -161,6 +180,7 @@
+                 "layout, skip values, and excluded frame indices."
+             )
+ 
++    # ------------------------------------------------------------------ indexing
+     def _register_scene(self, scene_name: str) -> None:
+         scene_root = self.data_root / scene_name
+         image_folder = scene_root / "images"
+@@ -192,13 +212,8 @@
+ 
+         scene_index = len(self.scene_metadata)
+         self.scene_metadata.append(
+-            {
+-                "name": scene_name,
+-                "images": image_paths,
+-                "events": event_paths,
+-                "height": height,
+-                "width": width,
+-            }
++            {"name": scene_name, "images": image_paths, "events": event_paths,
++             "height": height, "width": width}
+         )
+ 
+         excluded = self.excluded_frame_indices.get(scene_name, set())
+@@ -213,6 +228,15 @@
+     def __len__(self) -> int:
+         return len(self.samples)
+ 
++    def num_targets(self, index: int) -> int:
++        """K for sample ``index`` (skip in 'all' mode, 1 in 'random' mode)."""
++        return self.samples[index][3] if self.target_mode == "all" else 1
++
++    @property
++    def mean_targets(self) -> float:
++        return float(np.mean([self.num_targets(i) for i in range(len(self))]))
++
++    # ------------------------------------------------------------------ loading
+     @staticmethod
+     def _read_image(path: Path) -> torch.Tensor:
+         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+@@ -230,102 +254,129 @@
+         return top, left, top + self.crop_height, left + self.crop_width
+ 
+     @staticmethod
+-    def _apply_spatial_transform(
+-        images: torch.Tensor,
+-        voxels: torch.Tensor,
+-        mask: torch.Tensor,
+-        vertical_flip: bool,
+-        horizontal_flip: bool,
+-        rotations: int,
+-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        if vertical_flip:
+-            images = torch.flip(images, dims=(-2,))
+-            voxels = torch.flip(voxels, dims=(-2,))
+-            mask = torch.flip(mask, dims=(-2,))
+-        if horizontal_flip:
+-            images = torch.flip(images, dims=(-1,))
+-            voxels = torch.flip(voxels, dims=(-1,))
+-            mask = torch.flip(mask, dims=(-1,))
+-        if rotations:
+-            images = torch.rot90(images, rotations, dims=(-2, -1))
+-            voxels = torch.rot90(voxels, rotations, dims=(-2, -1))
+-            mask = torch.rot90(mask, rotations, dims=(-2, -1))
+-        return images.contiguous(), voxels.contiguous(), mask.contiguous()
++    def _apply_spatial_transform(tensors: Sequence[torch.Tensor], vertical_flip: bool,
++                                 horizontal_flip: bool, rotations: int) -> List[torch.Tensor]:
++        """Apply the same flip/rotation to every tensor (any rank, spatial dims last)."""
++        out = []
++        for tensor in tensors:
++            if vertical_flip:
++                tensor = torch.flip(tensor, dims=(-2,))
++            if horizontal_flip:
++                tensor = torch.flip(tensor, dims=(-1,))
++            if rotations:
++                tensor = torch.rot90(tensor, rotations, dims=(-2, -1))
++            out.append(tensor.contiguous())
++        return out
+ 
+     def __getitem__(self, index: int) -> Dict[str, object]:
+         scene_index, start, end, skip = self.samples[index]
+-        target = random.randrange(start + 1, end)
++        if self.target_mode == "all":
++            targets = list(range(start + 1, end))
++        else:
++            targets = [random.randrange(start + 1, end)]
++
+         metadata = self.scene_metadata[scene_index]
+         image_paths = metadata["images"]
+         event_paths = metadata["events"]
+-        height = int(metadata["height"])
+-        width = int(metadata["width"])
++        height, width = int(metadata["height"]), int(metadata["width"])
++        h, w = self.crop_height, self.crop_width
+ 
+         crop_box = self._choose_crop(height, width)
+         top, left, bottom, right = crop_box
+-        selected_images = torch.cat(
+-            [
+-                self._read_image(image_paths[frame])[:, top:bottom, left:right]
+-                for frame in (start, target, end)
+-            ],
+-            dim=0,
+-        )
+ 
+-        events_0t = _load_sequence(event_paths[start:target], self.crop_height, self.crop_width, crop_box)
+-        events_t1 = _load_sequence(event_paths[target:end], self.crop_height, self.crop_width, crop_box)
++        def read(frame: int) -> torch.Tensor:
++            return self._read_image(image_paths[frame])[:, top:bottom, left:right]
+ 
+-        event_counts = torch.cat(
+-            [
+-                _event_channels_or_zeros(events_0t, self.crop_height, self.crop_width),
+-                _event_channels_or_zeros(events_t1, self.crop_height, self.crop_width),
+-            ],
+-            dim=0,
+-        )
+-        event_mask = process_mask(event_counts)
++        endpoints = torch.cat((read(start), read(end)), dim=0)               # (6, h, w)
++        gts = torch.stack([read(target) for target in targets], dim=0)        # (K, 3, h, w)
+ 
+-        voxel_0t = _voxel_or_zeros(
+-            events_0t, self.bins, self.crop_height, self.crop_width
+-        )
+-        voxel_t1 = _voxel_or_zeros(
+-            events_t1, self.bins, self.crop_height, self.crop_width
+-        )
+-        events_1t = None if events_t1 is None else events_t1.copy().reverse()
+-        voxel_1t = _voxel_or_zeros(
+-            events_1t, self.bins, self.crop_height, self.crop_width
+-        )
+-        voxels = torch.cat((voxel_0t, voxel_t1, voxel_1t), dim=0).float()
++        # every interval file of the window is read once and shared by all targets
++        chunks = _load_event_chunks(event_paths[start:end], crop_box)
++        voxel_list, mask_list = [], []
++        for target in targets:
++            split = target - start                       # number of intervals in [start, target]
++            events_0t = _sequence_from_chunks(chunks[:split], h, w)
++            events_t1 = _sequence_from_chunks(chunks[split:], h, w)
++            event_counts = torch.cat(
++                (_event_channels_or_zeros(events_0t, h, w), _event_channels_or_zeros(events_t1, h, w)), dim=0)
++            mask_list.append(process_mask(event_counts).float())
++            events_1t = None if events_t1 is None else events_t1.copy().reverse()
++            voxel_list.append(torch.cat((
++                _voxel_or_zeros(events_0t, self.bins, h, w),
++                _voxel_or_zeros(events_t1, self.bins, h, w),
++                _voxel_or_zeros(events_1t, self.bins, h, w),
++            ), dim=0).float())
++        voxels = torch.stack(voxel_list, dim=0)                               # (K, 3*bins, h, w)
++        masks = torch.stack(mask_list, dim=0)                                 # (K, 1, h, w)
++        times = torch.tensor([(target - start) / float(end - start) for target in targets],
++                             dtype=torch.float32)                             # (K,)
+ 
+         if self.augment:
+             vertical_flip = random.random() < 0.5
+             horizontal_flip = random.random() < 0.5
+-            if self.rotate and self.crop_height == self.crop_width:
++            if self.rotate and h == w:
+                 rotations = random.randrange(4)
+             elif self.rotate:
+                 rotations = random.randrange(2) * 2
+             else:
+                 rotations = 0
+-            selected_images, voxels, event_mask = self._apply_spatial_transform(
+-                selected_images,
+-                voxels,
+-                event_mask,
+-                vertical_flip,
+-                horizontal_flip,
+-                rotations,
+-            )
++            endpoints, gts, voxels, masks = self._apply_spatial_transform(
++                (endpoints, gts, voxels, masks), vertical_flip, horizontal_flip, rotations)
+ 
+         return {
+-            "imgs": selected_images,
+-            "gt": selected_images[3:6],
++            "endpoints": endpoints,
++            "gts": gts,
+             "voxels": voxels,
+-            "mask": event_mask.float(),
++            "masks": masks,
++            "t": times,
+             "scene": str(metadata["name"]),
+             "start_index": start,
+-            "target_index": target,
+             "end_index": end,
++            "target_indices": torch.tensor(targets, dtype=torch.long),
+             "skip": skip,
+         }
+ 
+ 
++class SkipGroupedBatchSampler(Sampler[List[int]]):
++    """Shuffled batches in which all samples have the same number of targets K.
++
++    Needed for batch_size > 1 with target_mode='all' (skip=1 -> K=1, skip=3 -> K=3).
++    Within each group the order is reshuffled every epoch, then the batches of all
++    groups are interleaved in random order.
++    """
++
++    def __init__(self, dataset: BSERGBTrainDataset, batch_size: int, drop_last: bool = False,
++                 generator: Optional[torch.Generator] = None) -> None:
++        if batch_size <= 0:
++            raise ValueError("batch_size must be positive")
++        self.batch_size = int(batch_size)
++        self.drop_last = bool(drop_last)
++        self.generator = generator
++        groups: Dict[int, List[int]] = defaultdict(list)
++        for index in range(len(dataset)):
++            groups[dataset.num_targets(index)].append(index)
++        self.groups = dict(groups)
++
++    def _num_batches(self, size: int) -> int:
++        return size // self.batch_size if self.drop_last else math.ceil(size / self.batch_size)
++
++    def __len__(self) -> int:
++        return sum(self._num_batches(len(indices)) for indices in self.groups.values())
++
++    def __iter__(self) -> Iterator[List[int]]:
++        batches: List[List[int]] = []
++        for indices in self.groups.values():
++            order = torch.randperm(len(indices), generator=self.generator).tolist()
++            shuffled = [indices[i] for i in order]
++            for begin in range(0, len(shuffled), self.batch_size):
++                batch = shuffled[begin:begin + self.batch_size]
++                if len(batch) < self.batch_size and self.drop_last:
++                    continue
++                batches.append(batch)
++        for i in torch.randperm(len(batches), generator=self.generator).tolist():
++            yield batches[i]
++
++
+ def build_bsergb_train_dataset(
+     data_root: str | os.PathLike[str],
+     bins: int = 8,
+@@ -333,6 +384,7 @@
+     crop_size: int | Sequence[int] = 256,
+     scenes: Optional[Sequence[str]] = None,
+     augment: bool = True,
++    target_mode: str = "all",
+ ) -> BSERGBTrainDataset:
+     """Convenience builder used by train_bsergb.py."""
+ 
+@@ -343,4 +395,5 @@
+         crop_size=crop_size,
+         scenes=scenes,
+         augment=augment,
++        target_mode=target_mode,
+     )
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/flow_modules.py out/self/model/flow_modules.py
+--- src/model/flow_modules.py	1969-12-31 18:00:00.000000000 -0600
++++ out/self/model/flow_modules.py	2026-11-11 21:29:30.532158498 -0600
+@@ -0,0 +1,119 @@
++"""Stage 2-4 modules: coarse flow (cost volume), event-guided refinement, selective fusion."""
++from typing import List, Optional, Tuple
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from model.blocks import DenseBlock, up
++from model.raft import RAFT, default_raft_args
++from model.submodules import conv_resblock_one
++from model.warp import backwarp, bgr_to_gray
++
++
++def _strip_prefix(state_dict, prefix="module."):
++    return {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state_dict.items()}
++
++
++class CoarseFlowEstimator(nn.Module):
++    """Cost-volume flow between the event reconstruction at t and the gray key frames.
++
++    Both directions are computed in one RAFT call by stacking them on the batch axis:
++        image1 = [ref_t, ref_t],  image2 = [gray_0, gray_1]
++    so the outputs are F_{t->0} and F_{t->1} on the grid of time t, i.e. exactly the
++    flows needed for backward warping I_0 / I_1 to time t.
++    """
++
++    def __init__(self, iters: int = 12, freeze_bn: bool = True):
++        super().__init__()
++        # input_scale=1.0: inputs are in [0, 1]; RAFT maps them to [-1, 1] as in the original.
++        self.raft = RAFT(default_raft_args(), input_scale=1.0)
++        self.iters = int(iters)
++        self.freeze_bn = bool(freeze_bn)
++
++    def load_pretrained(self, path: str) -> None:
++        """Load official RAFT weights (e.g. raft-things.pth); 'module.' prefixes are stripped."""
++        checkpoint = torch.load(path, map_location="cpu")
++        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
++            checkpoint = checkpoint["state_dict"]
++        self.raft.load_state_dict(_strip_prefix(checkpoint), strict=True)
++
++    def train(self, mode: bool = True):
++        super().train(mode)
++        # RAFT's context encoder uses BatchNorm; with batch size 1 its statistics are
++        # meaningless, so (like RAFT fine-tuning) keep BN layers in eval mode.
++        if mode and self.freeze_bn:
++            self.raft.freeze_bn()
++        return self
++
++    def forward(self, ref_t: torch.Tensor, gray0: torch.Tensor, gray1: torch.Tensor,
++                iters: Optional[int] = None) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
++        batch = ref_t.shape[0]
++        # RAFT runs its encoders with autocast disabled, so feed fp32 even under --amp.
++        image1 = torch.cat((ref_t, ref_t), dim=0).repeat(1, 3, 1, 1).float()
++        image2 = torch.cat((gray0, gray1), dim=0).repeat(1, 3, 1, 1).float()
++        predictions = self.raft(image1, image2, iters=iters or self.iters)
++        flows_t0 = [flow[:batch] for flow in predictions]
++        flows_t1 = [flow[batch:] for flow in predictions]
++        return flows_t0, flows_t1
++
++
++class EventFlowRefiner(nn.Module):
++    """Refine a coarse flow F_{t->k} with the events between t and k.
++
++    Inputs per direction (weights are shared by both directions because the events are
++    always given in the t -> k direction, see ``reverse_voxel``):
++        coarse flow, I_k warped to t, the reference at t, |gray(warp) - ref|,
++        voxel E_{t->k}, event mask.
++    Outputs: refined flow (coarse + residual) and an occlusion logit for frame k.
++    """
++
++    def __init__(self, bins: int, flow_norm: float = 20.0, iters: int = 1):
++        super().__init__()
++        in_ch = 2 + 3 + 1 + 1 + bins + 1
++        self.flow_norm = float(flow_norm)
++        self.iters = int(iters)
++        self.enc1 = conv_resblock_one(in_ch, 32)
++        self.enc2 = conv_resblock_one(32, 64, stride=2)
++        self.enc3 = conv_resblock_one(64, 96, stride=2)
++        self.dec2 = up(96, 64)
++        self.dec1 = up(64, 32)
++        self.head = nn.Conv2d(32, 3, 3, 1, 1)
++        nn.init.zeros_(self.head.weight)  # start exactly from the coarse flow
++        nn.init.zeros_(self.head.bias)
++
++    def _step(self, flow, image_k, ref_t, events_tk, mask):
++        warped = backwarp(image_k, flow)
++        error = (bgr_to_gray(warped) - ref_t).abs()
++        x = torch.cat((flow / self.flow_norm, warped, ref_t, error, events_tk, mask), dim=1)
++        s1 = self.enc1(x)
++        s2 = self.enc2(s1)
++        s3 = self.enc3(s2)
++        y = self.dec1(self.dec2(s3, s2), s1)
++        out = self.head(y)
++        return flow + out[:, :2], out[:, 2:3]
++
++    def forward(self, coarse_flow, image_k, ref_t, events_tk, mask):
++        flow = coarse_flow
++        # iters == 0 disables the refinement (ablation): coarse flow, neutral occlusion logit.
++        occ_logit = coarse_flow.new_zeros(coarse_flow.shape[0], 1, *coarse_flow.shape[-2:])
++        for _ in range(self.iters):
++            flow, occ_logit = self._step(flow, image_k, ref_t, events_tk, mask)
++        return flow, occ_logit
++
++
++class SelectiveFusion(nn.Module):
++    """Pixel-wise selection between the two warped frames: I_t = M * W_0 + (1 - M) * W_1."""
++
++    def __init__(self, flow_norm: float = 20.0):
++        super().__init__()
++        # warp0(3) + warp1(3) + ref(1) + vis0(1) + vis1(1) + flows(4) + event mask(1) + t(1)
++        self.net = DenseBlock(15, 1)
++        self.flow_norm = float(flow_norm)
++
++    def forward(self, warp0, warp1, ref_t, vis0, vis1, flow_t0, flow_t1, mask, t_map):
++        x = torch.cat((warp0, warp1, ref_t, vis0, vis1,
++                       flow_t0 / self.flow_norm, flow_t1 / self.flow_norm, mask, t_map), dim=1)
++        weight0 = self.net(x)  # sigmoid output in (0, 1)
++        fused = weight0 * warp0 + (1.0 - weight0) * warp1
++        return fused, weight0
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/ourModel.py out/self/model/ourModel.py
+--- src/model/ourModel.py	2026-10-08 19:03:56.000000000 -0500
++++ out/self/model/ourModel.py	2026-11-11 23:22:22.301985597 -0600
+@@ -86,9 +86,34 @@
+             os.mkdir("./train/checkpoint")
+         torch.save(checkpoint, './train/checkpoint/ckpt_%s.pth' % (str(epoch)))
+ 
+-    def inference(self, imgs, voxels, mask):
++    @torch.no_grad()
++    def inference(self, imgs, voxels, mask, t=None):
++        """imgs: (B, 9, H, W) BGR in [0, 1] (the middle 3 channels are ignored),
++        voxels: (B, 3*bins, H, W) = [E_0->t, E_t->1, E_1->t], mask: (B, 1, H, W) event mask,
++        t: optional (B,) normalised target time. Returns the final prediction (B, 3, H, W)."""
+         imgs, voxels, mask = self.size_adapter.pad(imgs, voxels, mask)
+         self.eval()
+-        _, _, _, pred, _, _ = self.my_net(imgs, voxels, mask, self.args.bins)
++        _, _, _, pred, _, _ = self.my_net(imgs, voxels, mask, self.args.bins, t)
+         pred = self.size_adapter.unpad(pred[0])
+         return pred
++
++    @torch.no_grad()
++    def inference_window(self, endpoints, voxels, masks, t, chunk=None):
++        """All K intermediate frames of one window (e.g. skip=3 -> 3 frames).
++
++        endpoints: (B, 6, H, W) = [I_0, I_1]; voxels: (B, K, 3*bins, H, W);
++        masks: (B, K, 1, H, W); t: (B, K). Returns (B, K, 3, H, W).
++        ``chunk`` limits how many targets are processed per forward pass (memory).
++        """
++        batch, num_targets = voxels.shape[:2]
++        height, width = endpoints.shape[-2:]
++        img0 = endpoints[:, None, :3].expand(batch, num_targets, 3, height, width)
++        img1 = endpoints[:, None, 3:6].expand(batch, num_targets, 3, height, width)
++        imgs = torch.cat((img0, torch.zeros_like(img0), img1), dim=2).reshape(-1, 9, height, width)
++        voxels = voxels.reshape(batch * num_targets, -1, height, width)
++        masks = masks.reshape(batch * num_targets, 1, height, width)
++        t = t.reshape(batch * num_targets)
++        step = chunk or imgs.shape[0]
++        preds = [self.inference(imgs[i:i + step], voxels[i:i + step], masks[i:i + step], t[i:i + step])
++                 for i in range(0, imgs.shape[0], step)]
++        return torch.cat(preds, dim=0).reshape(batch, num_targets, 3, height, width)
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/ourNet.py out/self/model/ourNet.py
+--- src/model/ourNet.py	2026-11-12 11:00:08.000000000 -0600
++++ out/self/model/ourNet.py	2026-11-11 21:24:09.464139412 -0600
+@@ -1,51 +1,157 @@
+-import argparse
++"""Event-reference guided flow interpolation network.
++
++Pipeline (one target time t per forward pass):
++  1. E2V      : EventRecNet(E_{0->t}, E_{t->1}) -> gray reconstruction at t, supervised by gray GT (masked)
++  2. coarse   : RAFT cost volume between the reference at t and gray(I_0) / gray(I_1) -> F_{t->0}, F_{t->1}
++  3. refine   : events E_{t->k} + coarse flow -> refined flow + occlusion
++  4. fuse     : backward-warp I_0, I_1 -> W_0, W_1 -> selective fusion -> coarse frame
++  5. HCS      : event-defined motion patches (DSER++)
++  6. texture  : flow-guided texture blocks from both ends (VTinker-style) inside HCS -> multi-scale refinement
++
++Return value (same 6-tuple layout as DSER++ so train_bsergb.py / ourModel.py keep working):
++  (pure_rec[3ch], masked_rec[3ch], coarse, [pred_full, pred_half, pred_quarter], hcs_union, aux_dict)
++For ``stage == "rec"`` only (pure_rec[3ch], masked_rec[3ch]) is returned.
++"""
++from typing import Dict, Optional
+ 
+ import torch
++import torch.nn.functional as F
+ from torch import nn
+-from model.blocks import EventRecNet, DenseBlock, frame_encoder, event_encoder, ref_encoder
+ 
+-from raft import *
++from model.blocks import EventRecNet
++from model.flow_modules import CoarseFlowEstimator, EventFlowRefiner, SelectiveFusion
++from model.texture import FlowGuidedTextureMapper, TextureRefineDecoder, hcs_patch_masks
++from model.warp import backwarp, bgr_to_gray, reverse_voxel
++
++STAGES = ("rec", "flow", "full")
+ 
+-def bgr_to_gray(image: torch.Tensor) -> torch.Tensor:
+-    weights = image.new_tensor((0.114, 0.587, 0.299)).view(1, 3, 1, 1)
+-    return (image * weights).sum(dim=1, keepdim=True)
+ 
+ class MyNet(nn.Module):
+     def __init__(self, args):
+         super(MyNet, self).__init__()
+-        bins = args.bins
+-        self.stage=args.stage
+-        self.beta = args.beta
+-        self.mask_patch_size = args.mask_patch_size
+-        self.event_rec = EventRecNet(2 * bins)
+-        self.raft=RAFT()
+-        self.fusion = DenseBlock(64, 3)
+-        unit_dim = 32
+-        self.scale = 3
+-        self.encoder_f = frame_encoder(3, unit_dim // 4)
+-        self.encoder_e = event_encoder(bins, unit_dim // 2)
+-        self.encoder_ref = ref_encoder(3, unit_dim // 2)
+-
+-    def forward(self, imgs, voxels, mask, bins):
++        self.bins = int(args.bins)
++        self.stage = getattr(args, "stage", "full")
++        if self.stage not in STAGES:
++            raise ValueError(f"stage must be one of {STAGES}, got {self.stage!r}")
++        self.beta = float(getattr(args, "beta", 0.1))
++        self.mask_patch_size = int(getattr(args, "mask_patch_size", 32))
++        self.hcs_mode = getattr(args, "hcs_beta_mode", "sum")
++        self.ref_mode = getattr(args, "ref_mode", "composite")
++        self.rec_use_frames = bool(getattr(args, "rec_use_frames", False))
++        self.detach_rec_for_flow = bool(getattr(args, "detach_rec_for_flow", False))
++        flow_norm = 20.0
++
++        # 1. E2V (identical to DSER++ when rec_use_frames=False, so its weights can be loaded)
++        rec_in = 2 * self.bins + (2 if self.rec_use_frames else 0)
++        self.event_rec = EventRecNet(rec_in)
++        # 2. coarse flow from the cost volume
++        self.coarse_flow = CoarseFlowEstimator(iters=int(getattr(args, "raft_iters", 12)),
++                                               freeze_bn=not getattr(args, "no_freeze_raft_bn", False))
++        # 3. event-guided refinement (shared by both directions)
++        self.refiner = EventFlowRefiner(self.bins, flow_norm=flow_norm,
++                                        iters=int(getattr(args, "refine_iters", 1)))
++        # 4. selective fusion
++        self.fusion = SelectiveFusion(flow_norm=flow_norm)
++        # 5-6. texture mapping + refinement
++        self.texture = FlowGuidedTextureMapper(nf=16, window=int(getattr(args, "texture_window", 3)))
++        self.decoder = TextureRefineDecoder(self.bins, tex_channels=self.texture.out_channels)
++
++    # ------------------------------------------------------------------ helpers
++    def set_stage(self, stage: str) -> None:
++        if stage not in STAGES:
++            raise ValueError(f"stage must be one of {STAGES}")
++        self.stage = stage
++
++    def build_reference(self, rec, gray0, gray1, mask):
++        """Image at t that is matched against gray(I_0) / gray(I_1) in the cost volume.
++
++        The E2V output is only supervised inside the event mask, so outside it the
++        reconstruction is unconstrained. In 'composite' mode those pixels are replaced
++        by the mean of the two gray key frames (no events -> no brightness change), with
++        a soft transition at the mask border.
++        """
++        if self.ref_mode == "rec":
++            return rec
++        if self.ref_mode != "composite":
++            raise ValueError("ref_mode must be 'composite' or 'rec'")
++        soft = F.avg_pool2d(mask, kernel_size=7, stride=1, padding=3)
++        return soft * rec + (1.0 - soft) * 0.5 * (gray0 + gray1)
++
++    @staticmethod
++    def _time_map(t: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
++        batch, _, height, width = like.shape
++        if t is None:
++            return like.new_full((batch, 1, height, width), 0.5)
++        t = torch.as_tensor(t, dtype=like.dtype, device=like.device).reshape(-1, 1, 1, 1)
++        if t.shape[0] == 1 and batch > 1:
++            t = t.expand(batch, 1, 1, 1)
++        return t.expand(batch, 1, height, width)
++
++    # ------------------------------------------------------------------ forward
++    def forward(self, imgs, voxels, mask, bins=None, t=None):
++        bins = self.bins if bins is None else int(bins)
+         img0 = imgs[:, :3]
+-        img1 = imgs[:, 6:9]
++        img1 = imgs[:, 6:9]          # imgs[:, 3:6] is the GT target, never used here
+         v0t = voxels[:, :bins]
+         vt1 = voxels[:, bins:bins * 2]
+-        v1t = voxels[:, bins * 2:bins * 3]
+         v01 = torch.cat((v0t, vt1), 1)
+-        # 第一阶段
+-        pure_rec = self.event_rec(v01)
+-        rec = pure_rec * mask
+-
+-        if self.stage=="rec":
+-            return pure_rec, rec
+-
+-        gray_img0 = bgr_to_gray(img0)
+-        gray_img1 = bgr_to_gray(img1)
+-
+-        flow0=self.raft(gray_img0, pure_rec)
+-        flow1=self.raft(gray_img1, pure_rec)
+-
++        gray0 = bgr_to_gray(img0)
++        gray1 = bgr_to_gray(img1)
+ 
++        # ---- 1. E2V ------------------------------------------------------------
++        rec_in = torch.cat((v01, gray0, gray1), 1) if self.rec_use_frames else v01
++        pure_rec = self.event_rec(rec_in)        # (B, 1, H, W), sigmoid
++        rec = pure_rec * mask
++        if self.stage == "rec":
++            return pure_rec.repeat(1, 3, 1, 1), rec.repeat(1, 3, 1, 1)
+ 
++        # ---- 2. coarse flow from the cost volume ------------------------------
++        rec_for_flow = pure_rec.detach() if self.detach_rec_for_flow else pure_rec
++        ref_t = self.build_reference(rec_for_flow, gray0, gray1, mask)
++        flows_t0, flows_t1 = self.coarse_flow(ref_t, gray0, gray1)
++        coarse_t0, coarse_t1 = flows_t0[-1], flows_t1[-1]
++
++        # ---- 3. event-guided refinement (events always in the t -> k direction) -
++        events_t0 = reverse_voxel(v0t)           # E_{t->0}
++        events_t1 = vt1                          # E_{t->1}
++        flow_t0, occ0 = self.refiner(coarse_t0, img0, ref_t, events_t0, mask)
++        flow_t1, occ1 = self.refiner(coarse_t1, img1, ref_t, events_t1, mask)
++        vis0 = torch.sigmoid(-occ0)              # visibility of I_0 at t
++        vis1 = torch.sigmoid(-occ1)
++
++        # ---- 4. warp + selective fusion ---------------------------------------
++        warp0 = backwarp(img0, flow_t0)
++        warp1 = backwarp(img1, flow_t1)
++        t_map = self._time_map(t, img0)
++        coarse, fusion_mask = self.fusion(warp0, warp1, ref_t, vis0, vis1, flow_t0, flow_t1, mask, t_map)
++
++        # ---- 5. event-defined motion regions (DSER++ HCS) ----------------------
++        hcs0, hcs1, hcs_union = hcs_patch_masks(img0, img1, coarse, mask, self.mask_patch_size,
++                                                self.beta, self.hcs_mode)
++
++        aux: Dict[str, object] = {
++            "ref": ref_t,
++            "flows_t0": flows_t0, "flows_t1": flows_t1,      # RAFT iterations (coarse)
++            "flow_t0": flow_t0, "flow_t1": flow_t1,          # refined
++            "occ0": occ0, "occ1": occ1,
++            "warp0": warp0, "warp1": warp1,
++            "fusion_mask": fusion_mask,
++            "hcs0": hcs0, "hcs1": hcs1, "hcs_list": hcs_union,
++        }
++
++        if self.stage == "flow":
++            # Flow stage: texture/decoder are not trained; return the coarse frame pyramid.
++            predictions = [coarse,
++                           F.interpolate(coarse, scale_factor=0.5, mode="bilinear", align_corners=False),
++                           F.interpolate(coarse, scale_factor=0.25, mode="bilinear", align_corners=False)]
++        else:
++            # ---- 6. flow-guided texture mapping + refinement ------------------
++            texture, tex_conf, frame0_share = self.texture(img0, img1, coarse, ref_t, flow_t0, flow_t1,
++                                                           vis0, vis1)
++            predictions = self.decoder(coarse, warp0, warp1, ref_t, fusion_mask, mask, vis0, vis1,
++                                       v01, texture, hcs_union[1], tex_conf, frame0_share)
++            aux["tex_conf"] = tex_conf
++            aux["tex_frame0_share"] = frame0_share
+ 
++        return (pure_rec.repeat(1, 3, 1, 1), rec.repeat(1, 3, 1, 1), coarse, predictions,
++                hcs_union[0], aux)
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/raft.py out/self/model/raft.py
+--- src/model/raft.py	2026-11-12 11:00:08.000000000 -0600
++++ out/self/model/raft.py	2026-11-11 21:18:35.636473935 -0600
+@@ -3,10 +3,12 @@
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+-from utils.update import BasicUpdateBlock
+-from utils.extractor import BasicEncoder
+-from utils.corr import CorrBlock, AlternateCorrBlock
+-from utils.utils import coords_grid, upflow8
++import argparse
++
++from .utils.update import BasicUpdateBlock
++from .utils.extractor import BasicEncoder
++from .utils.corr import CorrBlock, AlternateCorrBlock
++from .utils.utils import coords_grid, upflow8
+ 
+ try:
+     autocast = torch.cuda.amp.autocast
+@@ -21,10 +23,23 @@
+             pass
+ 
+ 
++def default_raft_args(**overrides):
++    """Default (non-small) RAFT configuration, matching raft-things.pth."""
++    args = argparse.Namespace(small=False, mixed_precision=False, alternate_corr=False, dropout=0.0)
++    for key, value in overrides.items():
++        setattr(args, key, value)
++    return args
++
++
+ class RAFT(nn.Module):
+-    def __init__(self, args):
++    def __init__(self, args=None, input_scale=255.0):
+         super(RAFT, self).__init__()
++        if args is None:
++            args = default_raft_args()
+         self.args = args
++        # Original RAFT expects images in [0, 255]. Set input_scale=1.0 to feed [0, 1] images;
++        # the normalised range seen by the encoders is identical, so pretrained weights still apply.
++        self.input_scale = float(input_scale)
+ 
+ 
+         self.hidden_dim = hdim = 128
+@@ -73,8 +88,8 @@
+     def forward(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False):
+         """ Estimate optical flow between pair of frames """
+ 
+-        image1 = 2 * (image1 / 255.0) - 1.0
+-        image2 = 2 * (image2 / 255.0) - 1.0
++        image1 = 2 * (image1 / self.input_scale) - 1.0
++        image2 = 2 * (image2 / self.input_scale) - 1.0
+ 
+         image1 = image1.contiguous()
+         image2 = image2.contiguous()
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/submodules.py out/self/model/submodules.py
+--- src/model/submodules.py	1969-12-31 18:00:00.000000000 -0600
++++ out/self/model/submodules.py	2026-11-11 21:27:05.335242802 -0600
+@@ -0,0 +1,99 @@
++# Basic convolution helpers used by model/blocks.py.
++# Restored from DSER++ (https://github.com/yuhan0802/DSER-pp, Apache License 2.0),
++# keeping only the layers this project uses. The definitions are kept identical
++# so that DSER++ checkpoints (e.g. the EventRecNet weights) still load.
++import torch  # noqa: F401  (re-exported: model/blocks.py relies on `from model.submodules import *`)
++from torch import nn
++
++
++def actFunc(act, *args, **kwargs):
++    act = act.lower()
++    if act == 'relu':
++        return nn.ReLU()
++    elif act == 'relu6':
++        return nn.ReLU6()
++    elif act == 'leakyrelu':
++        return nn.LeakyReLU(0.1)
++    elif act == 'prelu':
++        return nn.PReLU()
++    elif act == 'rrelu':
++        return nn.RReLU(0.1, 0.3)
++    elif act == 'selu':
++        return nn.SELU()
++    elif act == 'celu':
++        return nn.CELU()
++    elif act == 'elu':
++        return nn.ELU()
++    elif act == 'gelu':
++        return nn.GELU()
++    elif act == 'tanh':
++        return nn.Tanh()
++    else:
++        raise NotImplementedError
++
++
++class ResBlock(nn.Module):
++    """Residual block: conv3x3 -> act -> conv3x3, plus identity."""
++
++    def __init__(self, in_chs, activation='relu'):
++        super(ResBlock, self).__init__()
++        op = []
++        for i in range(2):
++            op.append(conv3x3(in_chs, in_chs))
++            if i == 0:
++                op.append(actFunc(activation))
++        self.main_branch = nn.Sequential(*op)
++
++    def forward(self, x):
++        out = self.main_branch(x)
++        out += x
++        return out
++
++
++def conv1x1(in_channels, out_channels, stride=1):
++    return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0, bias=True)
++
++
++def conv3x3(in_channels, out_channels, stride=1):
++    return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=True)
++
++
++def conv5x5(in_channels, out_channels, stride=1):
++    return nn.Conv2d(in_channels, out_channels, kernel_size=5, stride=stride, padding=2, bias=True)
++
++
++def deconv4x4(in_channels, out_channels, stride=2):
++    return nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=stride, padding=1)
++
++
++def conv_resblock_three(in_channels, out_channels, stride=1):
++    return nn.Sequential(conv3x3(in_channels, out_channels, stride), nn.ReLU(), ResBlock(out_channels),
++                         ResBlock(out_channels), ResBlock(out_channels))
++
++
++def conv_resblock_two(in_channels, out_channels, stride=1):
++    return nn.Sequential(conv3x3(in_channels, out_channels, stride), nn.ReLU(), ResBlock(out_channels),
++                         ResBlock(out_channels))
++
++
++def conv_resblock_one(in_channels, out_channels, stride=1):
++    return nn.Sequential(conv3x3(in_channels, out_channels, stride), nn.ReLU(), ResBlock(out_channels))
++
++
++def conv5x5_resblock_one(in_channels, out_channels, stride=1):
++    # NOTE: identical to DSER++, which uses a 3x3 kernel here despite the name.
++    return nn.Sequential(conv3x3(in_channels, out_channels, stride), nn.ReLU(), ResBlock(out_channels))
++
++
++def conv_1x1_resblock_one(in_channels, out_channels, stride=1):
++    return nn.Sequential(conv1x1(in_channels, out_channels, stride), nn.ReLU(), ResBlock(out_channels))
++
++
++def conv3x3_leaky_relu(in_channels, out_channels, stride=1):
++    return nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=True),
++                         nn.LeakyReLU(0.1))
++
++
++def conv1x1_leaky_relu(in_channels, out_channels, stride=1):
++    return nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0, bias=True),
++                         nn.LeakyReLU(0.1))
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/texture.py out/self/model/texture.py
+--- src/model/texture.py	1969-12-31 18:00:00.000000000 -0600
++++ out/self/model/texture.py	2026-11-11 21:23:24.924136765 -0600
+@@ -0,0 +1,177 @@
++"""Stage 5-6: motion regions from events (DSER++ style) and flow-guided texture mapping
++(VTinker-inspired) followed by a multi-scale refinement decoder.
++
++The texture mapper is an independent re-implementation of the *idea* described in
++VTinker (Wu et al., AAAI 2026): texture candidates are taken from both key frames along
++the estimated flows, a local search window is matched against a query computed from the
++coarse frame, and the best-matching 2x2 blocks are gathered. Differences to VTinker:
++the selection is a soft (differentiable) attention instead of a hard argmax, the
++candidates are backward-warped with the refined F_{t->k} flows, and occlusion
++visibility is used as a prior.
++"""
++import math
++from typing import List, Tuple
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from model.blocks import event_encoder, frame_encoder, ref_encoder, up
++from model.submodules import conv1x1, conv3x3, conv_resblock_one
++from model.warp import backwarp, resize_flow
++
++
++@torch.no_grad()
++def hcs_patch_masks(img0: torch.Tensor, img1: torch.Tensor, coarse: torch.Tensor,
++                    event_mask: torch.Tensor, patch_size: int = 32, beta: float = 0.1,
++                    mode: str = "sum") -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
++    """Vectorised equivalent of DSER++ ``pyramid_patch_mask`` + ``mask_reverse``.
++
++    A patch is selected for frame k when (a) it contains at least one event and
++    (b) the coarse frame differs from frame k there: sum_{patch}|I_k - coarse| >= beta
++    (``mode='sum'``, identical to DSER++) or mean_{patch}|I_k - coarse| >= beta
++    (``mode='mean'``, independent of the patch size).
++
++    DSER++'s ``mask_reverse`` swaps the two masks wherever they differ, which is the
++    same as swapping them completely; this is reproduced below.
++
++    Returns (mask0, mask1, union), each a list at full, 1/2 and 1/4 resolution.
++    """
++    ps = int(patch_size)
++    height, width = coarse.shape[-2:]
++    if height % ps or width % ps:
++        raise ValueError(f"Input size {height}x{width} must be divisible by patch size {ps}")
++    if ps % 4:
++        raise ValueError("patch_size must be divisible by 4 to build the 1/4 scale mask")
++    coarse = coarse.detach()
++    events_in_patch = (F.max_pool2d(event_mask.float(), ps) > 0).float()
++
++    def select(frame):
++        score = F.avg_pool2d((frame - coarse).abs().sum(1, keepdim=True), ps)
++        if mode == "sum":
++            score = score * (ps * ps)
++        elif mode != "mean":
++            raise ValueError("mode must be 'sum' or 'mean'")
++        return (score >= beta).float() * events_in_patch
++
++    sel0, sel1 = select(img0), select(img1)
++    patch0, patch1 = sel1, sel0  # DSER++ mask_reverse
++    union = torch.clamp(patch0 + patch1, max=1.0)
++
++    def pyramid(mask):
++        return [F.interpolate(mask, scale_factor=ps // s, mode="nearest") for s in (1, 2, 4)]
++
++    return pyramid(patch0), pyramid(patch1), pyramid(union)
++
++
++class FlowGuidedTextureMapper(nn.Module):
++    """Gather 2x2 texture blocks from both key frames along F_{t->0} and F_{t->1}.
++
++    * descriptors (queries/keys) live at 1/4 resolution, values at 1/2 resolution;
++      one 1/4-scale descriptor therefore selects one 2x2 block of 1/2-scale values;
++    * for every block a (window x window) neighbourhood around the flow target is
++      searched in both frames -> 2 * window^2 candidates;
++    * candidate scores = cosine similarity / temperature + log(visibility) prior.
++    """
++
++    def __init__(self, nf: int = 16, window: int = 3):
++        super().__init__()
++        if window % 2 == 0:
++            raise ValueError("window must be odd")
++        self.window = int(window)
++        self.img_enc = frame_encoder(3, nf)      # [nf @ H, 2nf @ H/2, 4nf @ H/4]
++        self.query_enc = ref_encoder(4, nf)      # input: coarse frame (3) + reference (1)
++        desc = 4 * nf
++        self.q_proj = conv1x1(desc, desc)
++        self.k_proj = conv1x1(desc, desc)
++        self.log_scale = nn.Parameter(torch.tensor(math.log(10.0)))  # inverse temperature
++        self.vis_weight = nn.Parameter(torch.tensor(1.0))
++        self.out_proj = conv_resblock_one(2 * nf, 2 * nf)
++        self.out_channels = 2 * nf
++
++    def _unfold(self, x: torch.Tensor) -> torch.Tensor:
++        batch, channels, height, width = x.shape
++        n = self.window * self.window
++        cols = F.unfold(x, self.window, padding=self.window // 2)
++        return cols.view(batch, channels, n, height, width)
++
++    def forward(self, img0, img1, coarse, ref_t, flow_t0, flow_t1, vis0, vis1):
++        batch = img0.shape[0]
++        feats = self.img_enc(torch.cat((img0, img1), dim=0))
++        f_half, f_quarter = feats[1], feats[2]
++        query = self.query_enc(torch.cat((coarse, ref_t), dim=1))[2]
++
++        half = f_half.shape[-2:]
++        quarter = f_quarter.shape[-2:]
++        flows_half = torch.cat((resize_flow(flow_t0, size=half), resize_flow(flow_t1, size=half)), 0)
++        flows_quarter = torch.cat((resize_flow(flow_t0, size=quarter), resize_flow(flow_t1, size=quarter)), 0)
++        values = backwarp(f_half, flows_half)           # (2B, 2nf, H/2, W/2), aligned to t
++        keys = backwarp(f_quarter, flows_quarter)       # (2B, 4nf, H/4, W/4), aligned to t
++
++        q = F.normalize(self.q_proj(query), dim=1)
++        k = F.normalize(self.k_proj(keys), dim=1)
++        k0, k1 = k[:batch], k[batch:]
++        score0 = (q.unsqueeze(2) * self._unfold(k0)).sum(1)   # (B, n, H/4, W/4)
++        score1 = (q.unsqueeze(2) * self._unfold(k1)).sum(1)
++        scale = self.log_scale.exp()
++        prior0 = self.vis_weight * torch.log(F.adaptive_avg_pool2d(vis0, quarter).clamp_min(1e-4))
++        prior1 = self.vis_weight * torch.log(F.adaptive_avg_pool2d(vis1, quarter).clamp_min(1e-4))
++        logits = torch.cat((score0 * scale + prior0, score1 * scale + prior1), dim=1)
++        weights = torch.softmax(logits, dim=1)
++        n = self.window * self.window
++        w0, w1 = weights[:, :n], weights[:, n:]
++
++        v0 = F.pixel_unshuffle(values[:batch], 2)       # (B, 8nf, H/4, W/4): 2x2 blocks
++        v1 = F.pixel_unshuffle(values[batch:], 2)
++        gathered = (self._unfold(v0) * w0.unsqueeze(1)).sum(2) + (self._unfold(v1) * w1.unsqueeze(1)).sum(2)
++        texture = self.out_proj(F.pixel_shuffle(gathered, 2))  # (B, 2nf, H/2, W/2)
++        confidence = weights.max(dim=1, keepdim=True)[0]       # (B, 1, H/4, W/4)
++        frame0_share = w0.sum(dim=1, keepdim=True)             # how much texture came from I_0
++        return texture, confidence, frame0_share
++
++
++class TextureRefineDecoder(nn.Module):
++    """U-Net refinement that predicts residuals on top of the fused coarse frame.
++
++    The texture features are injected at 1/2 resolution only inside the event-defined
++    motion (HCS) regions. Returns predictions at full, 1/2 and 1/4 resolution, which is
++    what ``multiscale_l1`` in train_bsergb.py expects.
++    """
++
++    def __init__(self, bins: int, tex_channels: int = 32):
++        super().__init__()
++        in_ch = 3 + 3 + 3 + 1 + 1 + 1 + 1 + 1   # coarse, warp0, warp1, ref, M, mask, vis0, vis1
++        self.ev_enc = event_encoder(2 * bins, 16)   # [16 @ H, 32 @ H/2, 64 @ H/4]
++        self.enc1 = conv_resblock_one(in_ch, 32)
++        self.fuse1 = conv_resblock_one(32 + 16, 32)
++        self.enc2 = conv_resblock_one(32, 64, stride=2)
++        self.fuse2 = conv_resblock_one(64 + 32 + tex_channels + 1, 64)
++        self.enc3 = conv_resblock_one(64, 96, stride=2)
++        self.fuse3 = conv_resblock_one(96 + 64 + 2, 96)
++        self.head3 = conv3x3(96, 3)
++        self.up2 = up(96, 64)
++        self.head2 = conv3x3(64, 3)
++        self.up1 = up(64, 32)
++        self.head1 = conv3x3(32, 3)
++        for head in (self.head1, self.head2, self.head3):
++            nn.init.zeros_(head.weight)
++            nn.init.zeros_(head.bias)
++
++    def forward(self, coarse, warp0, warp1, ref_t, fusion_mask, event_mask, vis0, vis1,
++                v01, texture, hcs_half, tex_conf, frame0_share):
++        ev = self.ev_enc(v01)
++        x1 = self.enc1(torch.cat((coarse, warp0, warp1, ref_t, fusion_mask, event_mask, vis0, vis1), 1))
++        x1 = self.fuse1(torch.cat((x1, ev[0]), 1))
++        x2 = self.enc2(x1)
++        x2 = self.fuse2(torch.cat((x2, ev[1], texture * hcs_half, hcs_half), 1))
++        x3 = self.enc3(x2)
++        x3 = self.fuse3(torch.cat((x3, ev[2], tex_conf, frame0_share), 1))
++
++        coarse_half = F.interpolate(coarse, size=x2.shape[-2:], mode="bilinear", align_corners=False)
++        coarse_quarter = F.interpolate(coarse, size=x3.shape[-2:], mode="bilinear", align_corners=False)
++        pred_quarter = coarse_quarter + self.head3(x3)
++        y2 = self.up2(x3, x2)
++        pred_half = coarse_half + self.head2(y2)
++        y1 = self.up1(y2, x1)
++        pred_full = coarse + self.head1(y1)
++        return [p.clamp(0.0, 1.0) for p in (pred_full, pred_half, pred_quarter)]
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/utils/corr.py out/self/model/utils/corr.py
+--- src/model/utils/corr.py	2026-09-14 11:42:22.000000000 -0500
++++ out/self/model/utils/corr.py	2026-11-11 21:18:43.920081017 -0600
+@@ -1,6 +1,6 @@
+ import torch
+ import torch.nn.functional as F
+-from utils.utils import bilinear_sampler, coords_grid
++from .utils import bilinear_sampler, coords_grid
+ 
+ try:
+     import alt_cuda_corr
+@@ -40,7 +40,7 @@
+             corr = self.corr_pyramid[i]
+             dx = torch.linspace(-r, r, 2*r+1, device=coords.device)
+             dy = torch.linspace(-r, r, 2*r+1, device=coords.device)
+-            delta = torch.stack(torch.meshgrid(dy, dx), axis=-1)
++            delta = torch.stack(torch.meshgrid(dy, dx, indexing="ij"), axis=-1)
+ 
+             centroid_lvl = coords.reshape(batch*h1*w1, 1, 1, 2) / 2**i
+             delta_lvl = delta.view(1, 2*r+1, 2*r+1, 2)
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/utils/utils.py out/self/model/utils/utils.py
+--- src/model/utils/utils.py	2025-08-25 07:34:28.000000000 -0500
++++ out/self/model/utils/utils.py	2026-11-11 21:18:43.921904252 -0600
+@@ -72,7 +72,7 @@
+ 
+ 
+ def coords_grid(batch, ht, wd, device):
+-    coords = torch.meshgrid(torch.arange(ht, device=device), torch.arange(wd, device=device))
++    coords = torch.meshgrid(torch.arange(ht, device=device), torch.arange(wd, device=device), indexing="ij")
+     coords = torch.stack(coords[::-1], dim=0).float()
+     return coords[None].repeat(batch, 1, 1, 1)
+ 
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/model/warp.py out/self/model/warp.py
+--- src/model/warp.py	1969-12-31 18:00:00.000000000 -0600
++++ out/self/model/warp.py	2026-11-11 21:22:23.632133121 -0600
+@@ -0,0 +1,84 @@
++"""Warping and flow utilities shared by the flow, fusion and texture modules.
++
++Flow convention used everywhere in this project
++------------------------------------------------
++``flow_t0`` (B, 2, H, W) is defined on the pixel grid of the *target* time t and
++points into frame 0: pixel ``x`` of I_t corresponds to ``x + flow_t0(x)`` in I_0.
++Channel 0 is the horizontal (x) displacement, channel 1 the vertical (y) one,
++both in pixels of the tensor they are applied to.
++
++With this convention ``backwarp(I_0, flow_t0)`` produces an estimate of I_t.
++This is the direction RAFT returns for ``RAFT(image_t, image_0)``.
++"""
++import torch
++import torch.nn.functional as F
++
++
++def bgr_to_gray(image: torch.Tensor) -> torch.Tensor:
++    """OpenCV BGR (channel order of the BS-ERGB loader) -> luminance, keeps [0, 1]."""
++    weights = image.new_tensor((0.114, 0.587, 0.299)).view(1, 3, 1, 1)
++    return (image * weights).sum(dim=1, keepdim=True)
++
++
++def _base_grid(flow: torch.Tensor):
++    _, _, height, width = flow.shape
++    ys = torch.arange(height, device=flow.device, dtype=flow.dtype)
++    xs = torch.arange(width, device=flow.device, dtype=flow.dtype)
++    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
++    return grid_x, grid_y
++
++
++def backwarp(image: torch.Tensor, flow: torch.Tensor, padding_mode: str = "border") -> torch.Tensor:
++    """Sample ``image`` at ``x + flow(x)`` (backward warping, bilinear)."""
++    if image.shape[-2:] != flow.shape[-2:]:
++        raise ValueError(f"image {tuple(image.shape)} and flow {tuple(flow.shape)} sizes differ")
++    _, _, height, width = flow.shape
++    grid_x, grid_y = _base_grid(flow)
++    x = grid_x.unsqueeze(0) + flow[:, 0]
++    y = grid_y.unsqueeze(0) + flow[:, 1]
++    x = 2.0 * x / max(width - 1, 1) - 1.0
++    y = 2.0 * y / max(height - 1, 1) - 1.0
++    grid = torch.stack((x, y), dim=-1)
++    return F.grid_sample(image, grid.to(image.dtype), mode="bilinear",
++                         padding_mode=padding_mode, align_corners=True)
++
++
++def out_of_frame_mask(flow: torch.Tensor) -> torch.Tensor:
++    """1 where ``x + flow(x)`` falls inside the source frame, else 0. Shape (B, 1, H, W)."""
++    _, _, height, width = flow.shape
++    grid_x, grid_y = _base_grid(flow)
++    x = grid_x.unsqueeze(0) + flow[:, 0]
++    y = grid_y.unsqueeze(0) + flow[:, 1]
++    inside = (x >= 0) & (x <= width - 1) & (y >= 0) & (y <= height - 1)
++    return inside.unsqueeze(1).to(flow.dtype)
++
++
++def resize_flow(flow: torch.Tensor, scale: float = None, size=None) -> torch.Tensor:
++    """Resize a flow field and rescale its vectors accordingly."""
++    _, _, height, width = flow.shape
++    if size is None:
++        size = (int(round(height * scale)), int(round(width * scale)))
++    new_h, new_w = size
++    resized = F.interpolate(flow, size=(new_h, new_w), mode="bilinear", align_corners=False)
++    factor = flow.new_tensor((new_w / width, new_h / height)).view(1, 2, 1, 1)
++    return resized * factor
++
++
++def reverse_voxel(voxel: torch.Tensor) -> torch.Tensor:
++    """Time-reverse a voxel grid (bins on dim 1): flip the bin order and the polarity.
++
++    For the bilinear temporal voxelisation in util/voxelization.py this equals
++    voxelising the time-reversed, polarity-flipped event stream, i.e. it turns
++    E_{0->t} into E_{t->0}.
++    """
++    return -torch.flip(voxel, dims=[1])
++
++
++def edge_aware_smoothness(flow: torch.Tensor, image: torch.Tensor, alpha: float = 10.0) -> torch.Tensor:
++    """First-order edge-aware smoothness (lower weight across image edges)."""
++    gray = bgr_to_gray(image) if image.shape[1] == 3 else image
++    dx_img = (gray[..., :, 1:] - gray[..., :, :-1]).abs()
++    dy_img = (gray[..., 1:, :] - gray[..., :-1, :]).abs()
++    dx_flow = (flow[..., :, 1:] - flow[..., :, :-1]).abs().mean(1, keepdim=True)
++    dy_flow = (flow[..., 1:, :] - flow[..., :-1, :]).abs().mean(1, keepdim=True)
++    return (dx_flow * torch.exp(-alpha * dx_img)).mean() + (dy_flow * torch.exp(-alpha * dy_img)).mean()
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/requirements.txt out/self/requirements.txt
+--- src/requirements.txt	1969-12-31 18:00:00.000000000 -0600
++++ out/self/requirements.txt	2026-11-11 23:47:39.869927284 -0600
+@@ -0,0 +1,12 @@
++# PyTorch / torchvision are NOT listed here: install the CUDA build that matches your driver
++# first (setup_env.sh does this), e.g.
++#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
++# Tested API requirements: torch >= 2.0 (pixel_unshuffle, meshgrid(indexing=...), unbatched conv2d),
++# torchvision with torchvision.ops.DeformConv2d (model/blocks.py).
++numpy>=1.23
++scipy>=1.9
++opencv-python>=4.6
++Pillow>=9.0
++matplotlib>=3.6
++tqdm>=4.64
++lpips==0.1.4
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/setup_env.sh out/self/setup_env.sh
+--- src/setup_env.sh	1969-12-31 18:00:00.000000000 -0600
++++ out/self/setup_env.sh	2026-11-11 23:48:26.245035577 -0600
+@@ -0,0 +1,84 @@
++#!/usr/bin/env bash
++# 一键配置训练环境：conda 环境 -> PyTorch(CUDA) -> 其余依赖 -> RAFT 权重 -> LPIPS 权重 -> 环境检查
++#
++# 用法（在项目根目录执行）：
++#   bash setup_env.sh                       # 默认：环境名 evfi，Python 3.10，torch 2.5.1 + CUDA 12.1
++#   CUDA_TAG=cu118 bash setup_env.sh        # 驱动较老（nvidia-smi 显示 CUDA Version < 12.1）时用 CUDA 11.8
++#   CUDA_TAG=cu124 bash setup_env.sh        # 驱动支持 CUDA 12.4 及以上
++#   PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple bash setup_env.sh   # 普通依赖走国内镜像
++#   SKIP_RAFT=1 bash setup_env.sh           # 不下载 RAFT 权重（已手动放好时）
++set -euo pipefail
++cd "$(dirname "$0")"
++
++ENV_NAME="${ENV_NAME:-evfi}"
++PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
++TORCH_VERSION="${TORCH_VERSION:-2.5.1}"
++TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.20.1}"   # 必须与 torch 版本配套：2.4.1↔0.19.1, 2.5.1↔0.20.1, 2.6.0↔0.21.0
++CUDA_TAG="${CUDA_TAG:-cu121}"                          # cu118 / cu121 / cu124，不能高于 nvidia-smi 显示的 CUDA Version
++PIP_MIRROR="${PIP_MIRROR:-}"
++SKIP_RAFT="${SKIP_RAFT:-0}"
++RAFT_CKPT="checkpoints/raft-things.pth"
++
++echo ">>> 显卡与驱动信息"
++nvidia-smi || echo "警告：nvidia-smi 不可用，请确认已安装 NVIDIA 驱动"
++
++# ---------- 1. conda 环境 ----------
++if ! command -v conda >/dev/null 2>&1; then
++  echo "未找到 conda，请先安装 Miniconda：https://docs.conda.io/en/latest/miniconda.html"
++  exit 1
++fi
++set +u   # conda 的激活脚本在 set -u 下可能报 "unbound variable"
++eval "$(conda shell.bash hook)"
++if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
++  echo ">>> conda 环境 $ENV_NAME 已存在，直接使用"
++else
++  echo ">>> 创建 conda 环境 $ENV_NAME (python=$PYTHON_VERSION)"
++  conda create -y -n "$ENV_NAME" "python=$PYTHON_VERSION"
++fi
++conda activate "$ENV_NAME"
++set -u
++python -m pip install --upgrade pip
++
++# ---------- 2. PyTorch（带 CUDA） ----------
++echo ">>> 安装 torch==$TORCH_VERSION torchvision==$TORCHVISION_VERSION ($CUDA_TAG)"
++pip install "torch==$TORCH_VERSION" "torchvision==$TORCHVISION_VERSION" \
++  --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
++
++# ---------- 3. 其余依赖 ----------
++echo ">>> 安装 requirements.txt"
++if [[ -n "$PIP_MIRROR" ]]; then
++  pip install -r requirements.txt -i "$PIP_MIRROR"
++else
++  pip install -r requirements.txt
++fi
++
++# ---------- 4. RAFT 官方权重（princeton-vl/RAFT 的 download_models.sh） ----------
++mkdir -p checkpoints
++if [[ "$SKIP_RAFT" != "1" && ! -f "$RAFT_CKPT" ]]; then
++  echo ">>> 下载 RAFT 权重"
++  tmp_dir="$(mktemp -d)"
++  url="https://dl.dropboxusercontent.com/s/4j4z58wuv8o0mfz/models.zip"
++  if command -v wget >/dev/null 2>&1; then fetch=(wget -O "$tmp_dir/models.zip" "$url"); else fetch=(curl -fL -o "$tmp_dir/models.zip" "$url"); fi
++  if "${fetch[@]}"; then
++    unzip -o -q "$tmp_dir/models.zip" -d "$tmp_dir"
++    cp "$tmp_dir/models/raft-things.pth" "$RAFT_CKPT"
++    echo "    已保存到 $RAFT_CKPT"
++  else
++    echo "    下载失败（Dropbox 可能无法访问）。请手动从 RAFT 的 Google Drive 下载 raft-things.pth："
++    echo "    https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT"
++    echo "    并放到 $RAFT_CKPT"
++  fi
++  rm -rf "$tmp_dir"
++fi
++
++# ---------- 5. 预下载 LPIPS 所需的 AlexNet 权重（首次训练时也会自动下载） ----------
++echo ">>> 预下载 LPIPS(alex) 权重"
++python -c "import lpips; lpips.LPIPS(net='alex'); print('    LPIPS ok')" \
++  || echo "    LPIPS 权重下载失败：训练首次启动时会再尝试，或手动放到 ~/.cache/torch/hub/checkpoints/"
++
++# ---------- 6. 环境检查 + 冒烟测试 ----------
++python tools/check_env.py --raft-ckpt "$RAFT_CKPT"
++python tools/smoke_test.py --device cpu
++
++echo
++echo "环境配置完成。之后使用前先执行：conda activate $ENV_NAME"
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/tools/check_env.py out/self/tools/check_env.py
+--- src/tools/check_env.py	1969-12-31 18:00:00.000000000 -0600
++++ out/self/tools/check_env.py	2026-11-11 23:48:26.247043994 -0600
+@@ -0,0 +1,99 @@
++"""Check that the environment can run this project.
++
++    python tools/check_env.py [--raft-ckpt checkpoints/raft-things.pth]
++
++Prints library versions and GPU info, imports every project module, checks the
++APIs the code relies on, and (if given) loads the RAFT weights into the
++project's RAFT so that a wrong / corrupted checkpoint is caught before training.
++"""
++import argparse
++import importlib
++import os
++import sys
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++
++failures = []
++
++
++def check(name, fn):
++    try:
++        result = fn()
++        print(f"[ok]   {name}" + (f": {result}" if result else ""))
++    except Exception as error:  # noqa: BLE001 - report everything
++        failures.append(name)
++        print(f"[FAIL] {name}: {type(error).__name__}: {error}")
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--raft-ckpt", default="checkpoints/raft-things.pth")
++    args = parser.parse_args()
++
++    print(f"Python {sys.version.split()[0]}")
++    for package in ("torch", "torchvision", "numpy", "scipy", "cv2", "PIL", "matplotlib", "tqdm", "lpips"):
++        check(f"import {package}", lambda p=package: getattr(importlib.import_module(p), "__version__", ""))
++
++    import torch
++    import torch.nn.functional as F
++
++    def cuda_info():
++        if not torch.cuda.is_available():
++            raise RuntimeError("CUDA not available (CPU-only torch build or driver problem)")
++        props = torch.cuda.get_device_properties(0)
++        return (f"torch CUDA {torch.version.cuda}, {torch.cuda.device_count()} GPU(s), "
++                f"GPU0 = {props.name}, {props.total_memory / 2 ** 30:.1f} GB")
++    check("CUDA", cuda_info)
++
++    def deform_conv():
++        from torchvision.ops import DeformConv2d  # noqa: F401  (used by model/blocks.py)
++        return ""
++    check("torchvision.ops.DeformConv2d", deform_conv)
++
++    def tensor_apis():
++        assert F.pixel_unshuffle(torch.zeros(1, 1, 4, 4), 2).shape == (1, 4, 2, 2)
++        torch.meshgrid(torch.arange(2), torch.arange(2), indexing="ij")
++        return ""
++    check("F.pixel_unshuffle / meshgrid(indexing)", tensor_apis)
++
++    def unbatched_conv():
++        assert F.conv2d(torch.zeros(1, 8, 8), torch.ones(1, 1, 3, 3), padding=1).shape == (1, 8, 8)
++        return ""
++    check("unbatched conv2d (util/utils_func.process_mask)", unbatched_conv)
++
++    for module in ("model.ourNet", "model.ourModel", "model.flow_modules", "model.texture", "model.warp",
++                   "datasets", "util.voxelization", "util.event", "train_bsergb"):
++        check(f"import {module}", lambda m=module: importlib.import_module(m) and "")
++
++    def voxel_numpy2():
++        import numpy as np
++        from util.event import EventSequence
++        from util.voxelization import to_voxel_grid
++        feats = np.array([[1, 1, 0.0, 1], [2, 2, 0.5, -1], [3, 3, 1.0, 1]], dtype=np.float32)
++        return f"voxel shape {tuple(to_voxel_grid(EventSequence(feats, 8, 8), 4).shape)}"
++    check("to_voxel_grid (NumPy compatibility)", voxel_numpy2)
++
++    def lpips_alex():
++        import lpips
++        lpips.LPIPS(net="alex", verbose=False)
++        return "AlexNet weights available"
++    check("LPIPS(alex)", lpips_alex)
++
++    def raft_weights():
++        if not os.path.isfile(args.raft_ckpt):
++            raise FileNotFoundError(f"{args.raft_ckpt} not found (needed for --stage flow)")
++        from model.flow_modules import CoarseFlowEstimator
++        CoarseFlowEstimator().load_pretrained(args.raft_ckpt)
++        return f"{args.raft_ckpt} loads strictly into the project's RAFT"
++    check("RAFT checkpoint", raft_weights)
++
++    print()
++    if failures:
++        print(f"{len(failures)} check(s) failed: {', '.join(failures)}")
++        sys.exit(1)
++    print("Environment OK.")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/tools/mem_test.sh out/self/tools/mem_test.sh
+--- src/tools/mem_test.sh	1969-12-31 18:00:00.000000000 -0600
++++ out/self/tools/mem_test.sh	2026-11-11 23:43:44.637179053 -0600
+@@ -0,0 +1,59 @@
++#!/usr/bin/env bash
++# 显存测试：每个阶段 × 每个裁剪尺寸只跑 1 个 epoch 的前 STEPS 步，记录峰值显存。
++# 不加载任何权重（权重数值不影响显存），checkpoint 写到 train/memtest/，测完可以删掉。
++#
++# 用法（在项目根目录执行）：
++#   bash tools/mem_test.sh                                  # 三个阶段 × crop 256/384/512
++#   CROPS="256 448" STEPS=20 bash tools/mem_test.sh
++#   STAGES="flow full" EXTRA="--amp --raft-iters 8" bash tools/mem_test.sh
++#   SKIPS="1 3" bash tools/mem_test.sh                      # 与正式训练相同的 skip 组合
++set -uo pipefail          # 不用 -e：某个配置 OOM 时继续测下一个
++cd "$(dirname "$0")/.."
++
++BSERGB_ROOT="${BSERGB_ROOT:-/home/yuaobo/桌面/ljh/dataset/3_TRAINING}"
++CROPS="${CROPS:-256 384 512}"
++STAGES="${STAGES:-rec flow full}"
++STEPS="${STEPS:-20}"
++SKIPS="${SKIPS:-3}"       # 默认只用 skip=3：一个窗口 3 个目标（K=3），是显存最大的情况
++EXTRA="${EXTRA:-}"        # 额外参数，例如 "--amp --raft-iters 8"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
++
++OUT="train/memtest"
++mkdir -p "$OUT"
++SUMMARY="$OUT/summary.txt"
++: > "$SUMMARY"
++
++for stage in $STAGES; do
++  case "$stage" in
++    rec)  STAGE_ARGS=(--stage rec) ;;
++    flow) STAGE_ARGS=(--stage flow --freeze-rec --raft-iters 12) ;;   # 与 train_model.sh 的 P2 一致
++    full) STAGE_ARGS=(--stage full --raft-iters 12) ;;                # 与 train_model.sh 的 P3 一致
++    *) echo "未知阶段: $stage"; exit 1 ;;
++  esac
++  for crop in $CROPS; do
++    log="$OUT/${stage}_${crop}.log"
++    echo "=== stage=$stage crop=$crop steps=$STEPS skips=$SKIPS $EXTRA ==="
++    # shellcheck disable=SC2086
++    python train_bsergb.py --data-root "$BSERGB_ROOT" \
++      --bins 8 --skips $SKIPS --crop-size "$crop" --mask-patch-size 32 \
++      --batch-size 1 --workers 4 \
++      --target-mode all --target-weighting window --lambda-tc 0.1 \
++      "${STAGE_ARGS[@]}" \
++      --epochs 1 --max-steps-per-epoch "$STEPS" --log-interval 1 \
++      --output-dir "$OUT/ckpt_${stage}_${crop}" $EXTRA > "$log" 2>&1
++    status=$?
++    line=$(grep "\[GPU memory\]" "$log" | tail -1)
++    if [[ $status -ne 0 ]]; then
++      if grep -qi "out of memory" "$log"; then
++        line="[GPU memory] stage=$stage crop=$crop -> OOM（显存不足）"
++      else
++        line="[GPU memory] stage=$stage crop=$crop -> 运行失败，见 $log"
++      fi
++    fi
++    echo "$line" | tee -a "$SUMMARY"
++  done
++done
++
++echo
++echo "===== 汇总（$SUMMARY）====="
++cat "$SUMMARY"
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/tools/smoke_test.py out/self/tools/smoke_test.py
+--- src/tools/smoke_test.py	1969-12-31 18:00:00.000000000 -0600
++++ out/self/tools/smoke_test.py	2026-11-11 23:22:50.413740871 -0600
+@@ -0,0 +1,215 @@
++"""CPU/GPU smoke test: shapes, flow conventions, DSER++ mask equivalence, forward/backward per stage.
++
++Run from the repository root:
++    python tools/smoke_test.py            # CPU, random data, no pretrained weights needed
++    python tools/smoke_test.py --device cuda
++"""
++import argparse
++import os
++import sys
++
++import numpy as np
++import torch
++import torch.nn as nn
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++
++from model.loss import MaskedSSIMLoss  # noqa: E402
++from model.ourNet import MyNet  # noqa: E402
++from model.texture import hcs_patch_masks  # noqa: E402
++from model.warp import backwarp, reverse_voxel  # noqa: E402
++from util.event import EventSequence  # noqa: E402
++from util.utils_func import mask_reverse, pyramid_patch_mask  # noqa: E402
++from util.voxelization import to_voxel_grid  # noqa: E402
++import train_bsergb as tb  # noqa: E402
++
++
++class L1Perceptual(nn.Module):
++    """Stand-in for LPIPS so the test needs no downloads."""
++
++    def forward(self, a, b):
++        return (a - b).abs().mean(dim=(1, 2, 3), keepdim=True)
++
++
++def make_args(stage, bins=8):
++    return argparse.Namespace(
++        bins=bins, stage=stage, beta=0.1, mask_patch_size=32, hcs_beta_mode="sum",
++        ref_mode="composite", rec_use_frames=False, detach_rec_for_flow=False,
++        raft_iters=3, refine_iters=1, texture_window=3, no_freeze_raft_bn=False,
++        freeze_rec=False, freeze_raft=False, raft_lr_mult=0.25, rec_lr_mult=1.0, lr=1e-4,
++        lambda_rec=1.0, lambda_syn=1.0, lambda_ref=1.0, lambda_ps=1.0,
++        lambda_warp=0.5, lambda_smooth=0.01, warp_gamma=0.8, lambda_tc=0.1,
++    )
++
++
++def test_backwarp_direction(device):
++    img0 = torch.rand(1, 3, 64, 64, device=device)
++    shift = 3
++    gt = torch.roll(img0, shifts=shift, dims=-1)        # content moved +3 px in x from 0 to t
++    flow_t0 = torch.zeros(1, 2, 64, 64, device=device)
++    flow_t0[:, 0] = -shift                               # F_{t->0}: x_t + F = x_0
++    warped = backwarp(img0, flow_t0)
++    err = (warped - gt)[..., shift:].abs().max().item()
++    assert err < 1e-5, f"backwarp convention broken (err={err})"
++    print("[ok] backwarp: backwarp(I0, F_t->0) reproduces I_t")
++
++
++def test_reverse_voxel(bins=8):
++    rng = np.random.default_rng(0)
++    n = 2000
++    feats = np.stack([rng.uniform(0, 63, n), rng.uniform(0, 47, n), np.sort(rng.uniform(0, 1, n)),
++                      rng.choice([-1.0, 1.0], n)], axis=1).astype(np.float32)
++    seq = EventSequence(feats.copy(), 48, 64)
++    forward = to_voxel_grid(seq, bins)
++    reversed_seq = EventSequence(feats.copy(), 48, 64).reverse()
++    expected = to_voxel_grid(reversed_seq, bins)
++    err = (reverse_voxel(forward.unsqueeze(0))[0] - expected).abs().max().item()
++    assert err < 1e-3, f"reverse_voxel mismatch {err}"
++    print("[ok] reverse_voxel equals voxelising the reversed event stream")
++
++
++def test_hcs_equivalence(device):
++    torch.manual_seed(0)
++    img0, img1, coarse = (torch.rand(2, 3, 128, 128, device=device) for _ in range(3))
++    mask = (torch.rand(2, 1, 128, 128, device=device) > 0.995).float()
++    for beta in (0.1, 1010.0, 1024.0, 1040.0):  # patch sums are ~1024 for random images
++        m0, m1, union = hcs_patch_masks(img0, img1, coarse, mask, 32, beta, "sum")
++        ref0 = pyramid_patch_mask(img0, coarse, mask, patch_size=32, beta=beta)
++        ref1 = pyramid_patch_mask(img1, coarse, mask, patch_size=32, beta=beta)
++        for i in range(3):
++            r0, r1 = mask_reverse(ref0[i], ref1[i])
++            assert torch.equal(m0[i], r0) and torch.equal(m1[i], r1), f"HCS mismatch at scale {i}, beta {beta}"
++            assert torch.equal(union[i], torch.clamp(r0 + r1, max=1)), "HCS union mismatch"
++    print("[ok] hcs_patch_masks == DSER++ pyramid_patch_mask + mask_reverse")
++
++
++def random_batch(batch, bins, height, width, device):
++    imgs = torch.rand(batch, 9, height, width, device=device)
++    voxels = torch.randn(batch, 3 * bins, height, width, device=device) * 0.3
++    mask = (torch.rand(batch, 1, height, width, device=device) > 0.7).float()
++    t = torch.rand(batch, device=device) * 0.8 + 0.1
++    return imgs, voxels, mask, t
++
++
++def random_window_batch(batch, num_targets, bins, height, width, device):
++    """Batch in the dataset's multi-target layout (B windows, K targets each)."""
++    return {
++        "endpoints": torch.rand(batch, 6, height, width, device=device),
++        "gts": torch.rand(batch, num_targets, 3, height, width, device=device),
++        "voxels": torch.randn(batch, num_targets, 3 * bins, height, width, device=device) * 0.3,
++        "masks": (torch.rand(batch, num_targets, 1, height, width, device=device) > 0.7).float(),
++        "t": torch.arange(1, num_targets + 1, device=device).float().div(num_targets + 1).repeat(batch, 1),
++    }
++
++
++def test_stage(stage, device, num_targets=3, size=128):
++    torch.manual_seed(0)
++    args = make_args(stage)
++    model = MyNet(args).to(device)
++    tb.configure_trainable(model, args)
++    groups = tb.build_param_groups(model, args)
++    model.train()
++    batch = random_window_batch(1, num_targets, args.bins, size, size, device)
++    imgs, gt, voxels, mask, t, batch_size, k = tb.flatten_targets(batch, device)
++    assert imgs.shape == (num_targets, 9, size, size) and k == num_targets
++    assert torch.equal(imgs[:, 3:6], gt) and torch.equal(imgs[1, :3], batch["endpoints"][0, :3])
++    outputs = model(imgs, voxels, mask, args.bins, t)
++    losses = tb.compute_losses(outputs, imgs, gt, mask, L1Perceptual(), MaskedSSIMLoss(11).to(device), args)
++    losses["tc"] = tb.compute_temporal_loss(outputs, gt, mask, batch_size, k, args)
++    losses["total"] = losses["total"] + args.lambda_tc * losses["tc"]
++    assert num_targets < 2 or float(losses["tc"]) > 0, "temporal loss should be active for K >= 2"
++    losses["total"].backward()
++    trainable = [p for g in groups for p in g["params"]]
++    with_grad = sum(1 for p in trainable if p.grad is not None)
++    for p in trainable:
++        if p.grad is not None:
++            assert torch.isfinite(p.grad).all(), "non-finite gradient"
++    n = num_targets
++    if stage == "rec":
++        assert len(outputs) == 2 and outputs[0].shape == (n, 3, size, size)   # K gray reconstructions
++    else:
++        _, rec, coarse, preds, sel, aux = outputs
++        assert coarse.shape == (n, 3, size, size)                              # K predicted frames
++        assert [p.shape[-1] for p in preds] == [size, size // 2, size // 4]
++        assert sel.shape == (n, 1, size, size)
++        assert aux["flow_t0"].shape == (n, 2, size, size)
++    msg = ", ".join(f"{name}={float(value):.4f}" for name, value in losses.items())
++    print(f"[ok] stage={stage}, K={n}: outputs for {n} targets, params with grad {with_grad}/{len(trainable)} | {msg}")
++
++
++def _write_synthetic_bsergb(root, num_frames=6, height=64, width=96, events_per_interval=3000, seed=0):
++    """Tiny scene in BS-ERGB layout (images/*.png, events/*.npz with raw sensor coordinates)."""
++    import cv2
++    rng = np.random.default_rng(seed)
++    scene = os.path.join(root, "scene_000")
++    os.makedirs(os.path.join(scene, "images"))
++    os.makedirs(os.path.join(scene, "events"))
++    for i in range(num_frames):
++        cv2.imwrite(os.path.join(scene, "images", f"{i:06d}.png"),
++                    rng.integers(0, 255, (height, width, 3), dtype=np.uint8))
++    for i in range(num_frames - 1):
++        px = rng.integers(0, width, events_per_interval)
++        py = rng.integers(0, height, events_per_interval)
++        # inverse of the coordinate scaling in util/event.py load_events(bsergb=True)
++        raw_x = (px + 0.5) * 62000.0 / (2 * 970)
++        raw_y = (py + 0.5) * 20160.0 / 630
++        ts = np.sort(rng.uniform(i, i + 1, events_per_interval))
++        np.savez(os.path.join(scene, "events", f"{i:06d}.npz"), x=raw_x, y=raw_y, timestamp=ts,
++                 polarity=rng.integers(0, 2, events_per_interval).astype(np.float32))
++    return root
++
++
++def test_dataset_multi_target(bins=8):
++    import tempfile
++    from torch.utils.data import DataLoader
++    from datasets import SkipGroupedBatchSampler, build_bsergb_train_dataset
++    with tempfile.TemporaryDirectory() as root:
++        _write_synthetic_bsergb(root)
++        dataset = build_bsergb_train_dataset(root, bins=bins, skips=(1, 3), crop_size=64, target_mode="all")
++        # 6 frames: skip=1 -> 4 windows, skip=3 -> 2 windows
++        assert len(dataset) == 6, len(dataset)
++        sample = next(dataset[i] for i in range(len(dataset)) if dataset.samples[i][3] == 3)
++        assert sample["gts"].shape == (3, 3, 64, 64) and sample["voxels"].shape == (3, 3 * bins, 64, 64)
++        assert sample["masks"].shape == (3, 1, 64, 64)
++        assert torch.allclose(sample["t"], torch.tensor([0.25, 0.5, 0.75]))
++        assert sample["target_indices"].tolist() == [sample["start_index"] + k for k in (1, 2, 3)]
++        # different targets -> different event splits
++        assert not torch.equal(sample["voxels"][0], sample["voxels"][2])
++        sampler = SkipGroupedBatchSampler(dataset, batch_size=2, generator=torch.Generator().manual_seed(0))
++        loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
++        seen = 0
++        for batch in loader:
++            k = batch["gts"].shape[1]
++            assert all(int(s) == k for s in batch["skip"]), "mixed K inside a batch"
++            seen += batch["gts"].shape[0]
++        assert seen == len(dataset)
++        single = build_bsergb_train_dataset(root, bins=bins, skips=(3,), crop_size=64, target_mode="random")
++        assert single[0]["gts"].shape[0] == 1
++    print("[ok] dataset: skip=3 window returns 3 targets; batches never mix K")
++
++
++def test_inference_padding():
++    from model.ourModel import Model
++    args = make_args("full")
++    wrapper = Model(args, inference_only=True)
++    net_device = next(wrapper.my_net.parameters()).device
++    imgs, voxels, mask, t = random_batch(1, args.bins, 100, 130, net_device)
++    pred = wrapper.inference(imgs, voxels, mask, t)
++    assert pred.shape == (1, 3, 100, 130), pred.shape
++    print("[ok] Model.inference pads/unpads arbitrary sizes")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--device", default="cpu")
++    device = torch.device(parser.parse_args().device)
++    test_backwarp_direction(device)
++    test_reverse_voxel()
++    test_hcs_equivalence(device)
++    test_dataset_multi_target()
++    for stage_name in ("rec", "flow", "full"):
++        test_stage(stage_name, device, num_targets=3)   # skip=3 window
++    test_stage("full", device, num_targets=1)           # skip=1 window
++    test_inference_padding()
++    print("All smoke tests passed.")
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/train_bsergb.py out/self/train_bsergb.py
+--- src/train_bsergb.py	2026-11-12 10:35:34.000000000 -0600
++++ out/self/train_bsergb.py	2026-11-11 23:43:18.870877907 -0600
+@@ -1,4 +1,11 @@
+-"""Train or fine-tune DSER++ on the BS-ERGB training split."""
++"""Train the event-reference guided flow interpolation network on BS-ERGB.
++
++Recommended three-stage schedule (each stage can start from the previous checkpoint):
++  1) --stage rec   : train only the E2V network (EventRecNet) with the masked gray GT;
++  2) --stage flow  : load stage-1 weights + official RAFT weights, train coarse flow,
++                     event refinement and selective fusion (add --freeze-rec);
++  3) --stage full  : train everything end-to-end incl. texture mapping and refinement.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -17,9 +24,10 @@
+ from torch.utils.data import DataLoader
+ from tqdm import tqdm
+ 
+-from datasets import build_bsergb_train_dataset
++from datasets import TARGET_MODES, SkipGroupedBatchSampler, build_bsergb_train_dataset
+ from model.loss import MaskedSSIMLoss
+-from model.ourNet import MyNet
++from model.ourNet import STAGES, MyNet
++from model.warp import backwarp, edge_aware_smoothness
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+@@ -62,6 +70,8 @@
+     parser.add_argument("--seed", default=1234, type=int)
+     parser.add_argument("--log-interval", default=20, type=int)
+     parser.add_argument("--save-every", default=1, type=int)
++    parser.add_argument("--no-save", action="store_true",
++                        help="Do not write checkpoints (e.g. for memory / speed tests)")
+     parser.add_argument(
+         "--max-steps-per-epoch",
+         default=None,
+@@ -73,6 +83,42 @@
+     parser.add_argument("--lambda-syn", default=1.0, type=float)
+     parser.add_argument("--lambda-ref", default=1.0, type=float)
+     parser.add_argument("--lambda-ps", default=1.0, type=float)
++    parser.add_argument("--target-mode", default="all", choices=TARGET_MODES,
++                        help="'all': a skip-N window predicts all N intermediate frames (K=N); "
++                             "'random': one random target per window (K=1, old behaviour)")
++    parser.add_argument("--target-weighting", default="window", choices=("window", "frame"),
++                        help="'window': every window has the same weight (losses averaged over its K "
++                             "targets); 'frame': every target frame has the same weight")
++    parser.add_argument("--lambda-tc", default=0.0, type=float,
++                        help="Temporal consistency between adjacent targets of a window: "
++                             "|(P_k+1 - P_k) - (G_k+1 - G_k)| (needs K >= 2)")
++    parser.add_argument("--lambda-warp", default=0.5, type=float,
++                        help="Photometric loss on the coarse (RAFT) and refined flows")
++    parser.add_argument("--lambda-smooth", default=0.0, type=float,
++                        help="Edge-aware smoothness of the refined flows (0 disables)")
++    parser.add_argument("--warp-gamma", default=0.8, type=float,
++                        help="RAFT-style weight decay over the coarse-flow iterations")
++
++    # ---- network / stage options -------------------------------------------------
++    parser.add_argument("--stage", default="full", choices=STAGES)
++    parser.add_argument("--raft-ckpt", default=None,
++                        help="Official RAFT weights (e.g. raft-things.pth) loaded into the coarse flow net")
++    parser.add_argument("--raft-iters", default=12, type=int)
++    parser.add_argument("--refine-iters", default=1, type=int)
++    parser.add_argument("--texture-window", default=3, type=int)
++    parser.add_argument("--ref-mode", default="composite", choices=("composite", "rec"),
++                        help="Reference for the cost volume: E2V inside the event mask, key-frame mean outside")
++    parser.add_argument("--rec-use-frames", action="store_true",
++                        help="Also feed gray I0/I1 to the E2V net (not compatible with DSER++ EventRecNet weights)")
++    parser.add_argument("--detach-rec-for-flow", action="store_true",
++                        help="Stop flow/synthesis gradients from reaching the E2V net")
++    parser.add_argument("--hcs-beta-mode", default="sum", choices=("sum", "mean"),
++                        help="'sum' reproduces DSER++ (patch sum >= beta); 'mean' thresholds the patch mean")
++    parser.add_argument("--no-freeze-raft-bn", action="store_true")
++    parser.add_argument("--freeze-rec", action="store_true", help="Do not update the E2V network")
++    parser.add_argument("--freeze-raft", action="store_true", help="Do not update RAFT")
++    parser.add_argument("--raft-lr-mult", default=0.25, type=float)
++    parser.add_argument("--rec-lr-mult", default=1.0, type=float)
+     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision")
+     parser.add_argument(
+         "--data-parallel",
+@@ -162,7 +208,8 @@
+ 
+ 
+ def lpips_distance(metric: torch.nn.Module, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+-    return metric(pred * 2.0 - 1.0, target * 2.0 - 1.0).mean()
++    # Images are OpenCV BGR; LPIPS was trained on RGB, so swap the channels first.
++    return metric(pred[:, [2, 1, 0]] * 2.0 - 1.0, target[:, [2, 1, 0]] * 2.0 - 1.0).mean()
+ 
+ 
+ def multiscale_l1(predictions: Iterable[torch.Tensor], gt: torch.Tensor) -> torch.Tensor:
+@@ -174,24 +221,154 @@
+     return loss
+ 
+ 
+-def compute_losses(outputs: Tuple[object, ...], gt: torch.Tensor, mask: torch.Tensor, perceptual: torch.nn.Module, structural_loss: MaskedSSIMLoss, args: argparse.Namespace) -> Dict[str, torch.Tensor]:
+-    _, masked_reference, coarse, predictions, selected_mask, _ = outputs
+-    final_prediction = predictions[0]
++def min_photometric(warp0: torch.Tensor, warp1: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
++    """Occlusion-tolerant photometric loss: every pixel only needs one good source frame."""
++    err0 = (warp0 - gt).abs().mean(1, keepdim=True)
++    err1 = (warp1 - gt).abs().mean(1, keepdim=True)
++    return torch.minimum(err0, err1).mean() + 0.1 * (err0.mean() + err1.mean())
++
++
++def sequence_warp_loss(img0, img1, gt, flows_t0, flows_t1, gamma: float) -> torch.Tensor:
++    """RAFT-style weighted photometric loss over all coarse-flow iterations."""
++    count = len(flows_t0)
++    loss = gt.new_zeros(())
++    for index, (flow_t0, flow_t1) in enumerate(zip(flows_t0, flows_t1)):
++        weight = gamma ** (count - index - 1)
++        loss = loss + weight * min_photometric(backwarp(img0, flow_t0), backwarp(img1, flow_t1), gt)
++    return loss
++
+ 
+-    gray_gt = bgr_to_gray(gt) * mask
+-    gray_gt = gray_gt.repeat(1, 3, 1, 1)
++def compute_losses(outputs: Tuple[object, ...], imgs: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
++                   perceptual: torch.nn.Module, structural_loss: MaskedSSIMLoss,
++                   args: argparse.Namespace) -> Dict[str, torch.Tensor]:
++    zero = gt.new_zeros(())
++    masked_reference = outputs[1]
++    gray_gt = (bgr_to_gray(gt) * mask).repeat(1, 3, 1, 1)
+     loss_rec = F.l1_loss(masked_reference, gray_gt) + lpips_distance(perceptual, masked_reference, gray_gt)
+-    loss_syn = F.l1_loss(coarse, gt) + lpips_distance(perceptual, coarse, gt)
+-    loss_ref = multiscale_l1(predictions, gt) + lpips_distance(perceptual, final_prediction, gt)
+-    loss_ps = structural_loss(final_prediction, gt, selected_mask)
+-    total = (args.lambda_rec * loss_rec + args.lambda_syn * loss_syn + args.lambda_ref * loss_ref + args.lambda_ps * loss_ps)
+-    return {
+-        "total": total,
+-        "rec": loss_rec,
+-        "syn": loss_syn,
+-        "ref": loss_ref,
+-        "ps": loss_ps,
+-    }
++    losses = {"rec": loss_rec, "syn": zero, "warp": zero, "smooth": zero, "ref": zero, "ps": zero}
++    total = args.lambda_rec * loss_rec
++
++    if args.stage != "rec":
++        _, _, coarse, predictions, selected_mask, aux = outputs
++        img0, img1 = imgs[:, :3], imgs[:, 6:9]
++        losses["syn"] = F.l1_loss(coarse, gt) + lpips_distance(perceptual, coarse, gt)
++        losses["warp"] = (sequence_warp_loss(img0, img1, gt, aux["flows_t0"], aux["flows_t1"], args.warp_gamma)
++                          + min_photometric(aux["warp0"], aux["warp1"], gt))
++        total = total + args.lambda_syn * losses["syn"] + args.lambda_warp * losses["warp"]
++        if args.lambda_smooth > 0:
++            losses["smooth"] = (edge_aware_smoothness(aux["flow_t0"], gt)
++                                + edge_aware_smoothness(aux["flow_t1"], gt))
++            total = total + args.lambda_smooth * losses["smooth"]
++        if args.stage == "full":
++            final_prediction = predictions[0]
++            losses["ref"] = multiscale_l1(predictions, gt) + lpips_distance(perceptual, final_prediction, gt)
++            losses["ps"] = structural_loss(final_prediction, gt, selected_mask)
++            total = total + args.lambda_ref * losses["ref"] + args.lambda_ps * losses["ps"]
++
++    losses["total"] = total
++    return losses
++
++
++def flatten_targets(batch: Dict[str, object], device: torch.device):
++    """(B, K, ...) window batch -> (B*K, ...) per-target batch for MyNet.
++
++    imgs keeps the original 9-channel layout [I_0, GT_t, I_1] so MyNet / compute_losses
++    are unchanged; targets of one window stay contiguous and in ascending time order.
++    """
++    endpoints = batch["endpoints"].to(device, non_blocking=True)   # (B, 6, H, W)
++    gts = batch["gts"].to(device, non_blocking=True)               # (B, K, 3, H, W)
++    voxels = batch["voxels"].to(device, non_blocking=True)         # (B, K, 3*bins, H, W)
++    masks = batch["masks"].to(device, non_blocking=True)           # (B, K, 1, H, W)
++    times = batch["t"].to(device, non_blocking=True)               # (B, K)
++    batch_size, num_targets, _, height, width = gts.shape
++    img0 = endpoints[:, None, :3].expand(batch_size, num_targets, 3, height, width)
++    img1 = endpoints[:, None, 3:6].expand(batch_size, num_targets, 3, height, width)
++    imgs = torch.cat((img0, gts, img1), dim=2).reshape(batch_size * num_targets, 9, height, width)
++    return (imgs,
++            gts.reshape(batch_size * num_targets, 3, height, width),
++            voxels.reshape(batch_size * num_targets, voxels.shape[2], height, width),
++            masks.reshape(batch_size * num_targets, 1, height, width),
++            times.reshape(batch_size * num_targets),
++            batch_size, num_targets)
++
++
++def temporal_consistency_loss(pred: torch.Tensor, target: torch.Tensor, batch_size: int, num_targets: int,
++                              mask: Optional[torch.Tensor] = None) -> torch.Tensor:
++    """|(P_{k+1} - P_k) - (G_{k+1} - G_k)| over adjacent targets of the same window.
++
++    Flow-free, so it is valid for any motion; it penalises errors that change from one
++    target time to the next (flicker). ``mask`` restricts it to pixels valid in both frames.
++    """
++    if num_targets < 2:
++        return pred.new_zeros(())
++    shape = (batch_size, num_targets) + tuple(pred.shape[1:])
++    pred = pred.reshape(shape)
++    target = target.reshape(shape)
++    diff = ((pred[:, 1:] - pred[:, :-1]) - (target[:, 1:] - target[:, :-1])).abs()
++    if mask is None:
++        return diff.mean()
++    mask = mask.reshape((batch_size, num_targets) + tuple(mask.shape[1:]))
++    both = (mask[:, 1:] * mask[:, :-1]).expand_as(diff)
++    return (diff * both).sum() / both.sum().clamp_min(1.0)
++
++
++def compute_temporal_loss(outputs: Tuple[object, ...], gt: torch.Tensor, mask: torch.Tensor,
++                          batch_size: int, num_targets: int, args: argparse.Namespace) -> torch.Tensor:
++    if args.stage == "rec":
++        gray_gt = (bgr_to_gray(gt) * mask).repeat(1, 3, 1, 1)
++        return temporal_consistency_loss(outputs[1], gray_gt, batch_size, num_targets, mask)
++    if args.stage == "flow":
++        return temporal_consistency_loss(outputs[2], gt, batch_size, num_targets)
++    return temporal_consistency_loss(outputs[3][0], gt, batch_size, num_targets)
++
++
++def configure_trainable(model: MyNet, args: argparse.Namespace) -> None:
++    """Freeze the sub-networks that the current stage does not train."""
++    for parameter in model.parameters():
++        parameter.requires_grad_(True)
++    frozen = []
++    if args.stage == "rec":
++        frozen += ["coarse_flow", "refiner", "fusion", "texture", "decoder"]
++    elif args.stage == "flow":
++        frozen += ["texture", "decoder"]
++    if args.freeze_rec:
++        frozen.append("event_rec")
++    if args.freeze_raft:
++        frozen.append("coarse_flow")
++    for name in set(frozen):
++        for parameter in getattr(model, name).parameters():
++            parameter.requires_grad_(False)
++    if args.stage == "rec" and args.freeze_rec:
++        raise ValueError("--freeze-rec leaves nothing to train in the rec stage")
++
++
++def build_param_groups(model: MyNet, args: argparse.Namespace):
++    groups = {"other": [], "raft": [], "rec": []}
++    for name, parameter in model.named_parameters():
++        if not parameter.requires_grad:
++            continue
++        if name.startswith("coarse_flow."):
++            groups["raft"].append(parameter)
++        elif name.startswith("event_rec."):
++            groups["rec"].append(parameter)
++        else:
++            groups["other"].append(parameter)
++    multipliers = {"other": 1.0, "raft": args.raft_lr_mult, "rec": args.rec_lr_mult}
++    param_groups = [
++        {"params": params, "lr": args.lr * multipliers[key], "name": key}
++        for key, params in groups.items() if params
++    ]
++    if not param_groups:
++        raise RuntimeError("No trainable parameters for this stage")
++    return param_groups
++
++
++def gpu_memory_gib(device: torch.device) -> Tuple[float, float]:
++    """Peak allocated / reserved CUDA memory since the last reset, in GiB (0 on CPU)."""
++    if device.type != "cuda":
++        return 0.0, 0.0
++    return (torch.cuda.max_memory_allocated(device) / 2 ** 30,
++            torch.cuda.max_memory_reserved(device) / 2 ** 30)
+ 
+ 
+ def save_checkpoint(
+@@ -240,6 +417,10 @@
+         raise ValueError("crop-size must be divisible by 32")
+     if args.crop_size % args.mask_patch_size != 0:
+         raise ValueError("crop-size must be divisible by mask-patch-size")
++    if args.mask_patch_size % 4 != 0:
++        raise ValueError("mask-patch-size must be divisible by 4")
++    if args.resume and args.raft_ckpt:
++        raise ValueError("--raft-ckpt is ignored when resuming; remove it")
+ 
+     device = torch.device(args.device)
+     if device.type == "cuda" and not torch.cuda.is_available():
+@@ -263,27 +444,38 @@
+         crop_size=args.crop_size,
+         scenes=args.scenes,
+         augment=not args.no_augmentation,
++        target_mode=args.target_mode,
+     )
+     generator = torch.Generator()
+     generator.manual_seed(args.seed)
++    # Batches only contain windows with the same number of targets K (skip=1 -> 1, skip=3 -> 3).
++    batch_sampler = SkipGroupedBatchSampler(dataset, args.batch_size, drop_last=False, generator=generator)
+     dataloader = DataLoader(
+         dataset,
+-        batch_size=args.batch_size,
+-        shuffle=True,
++        batch_sampler=batch_sampler,
+         num_workers=args.workers,
+         pin_memory=device.type == "cuda",
+-        drop_last=False,
+         persistent_workers=args.workers > 0,
+         worker_init_fn=seed_worker,
+         generator=generator,
+     )
++    mean_targets = dataset.mean_targets
++    print(f"Target mode: {args.target_mode} | windows per K: "
++          f"{ {k: len(v) for k, v in sorted(batch_sampler.groups.items())} } | mean K: {mean_targets:.2f}")
+     if len(dataloader) == 0:
+         raise RuntimeError("The BS-ERGB DataLoader is empty")
+ 
+     model = MyNet(args).to(device)
+-    optimizer = AdamW(
+-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+-    )
++    if not args.resume:
++        if args.pretrained:
++            load_network_weights(model, args.pretrained, strict=not args.allow_partial_pretrained)
++            print(f"Loaded pretrained weights from {args.pretrained}")
++        if args.raft_ckpt:
++            # Loaded after --pretrained so that a stage-1 checkpoint does not overwrite RAFT.
++            model.coarse_flow.load_pretrained(args.raft_ckpt)
++            print(f"Loaded RAFT weights from {args.raft_ckpt}")
++    configure_trainable(model, args)
++    optimizer = AdamW(build_param_groups(model, args), lr=args.lr, weight_decay=args.weight_decay)
+     steps_per_epoch = len(dataloader)
+     if args.max_steps_per_epoch is not None:
+         steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
+@@ -299,9 +491,6 @@
+     if args.resume:
+         start_epoch, global_step = resume_training(model, optimizer, scheduler, scaler, args.resume)
+         print(f"Resumed {args.resume} at epoch {start_epoch}")
+-    elif args.pretrained:
+-        load_network_weights(model, args.pretrained, strict=not args.allow_partial_pretrained)
+-        print(f"Loaded pretrained weights from {args.pretrained}")
+ 
+     if args.data_parallel:
+         if device.type != "cuda" or torch.cuda.device_count() < 2:
+@@ -314,14 +503,21 @@
+     structural_loss = MaskedSSIMLoss(window_size=11).to(device)
+ 
+     print(
+-        f"Training samples: {len(dataset)} | batches: {len(dataloader)} | "
+-        f"parameters: {sum(p.numel() for p in model.parameters()):,}"
++        f"Stage: {args.stage} | training samples: {len(dataset)} | batches: {len(dataloader)} | "
++        f"parameters: {sum(p.numel() for p in model.parameters()):,} | "
++        f"trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
+     )
+     output_dir = Path(args.output_dir)
+ 
+     for epoch in range(start_epoch, args.epochs):
+         model.train()
+-        running = {"total": 0.0, "rec": 0.0, "syn": 0.0, "ref": 0.0, "ps": 0.0}
++        running = {"total": 0.0, "rec": 0.0, "syn": 0.0, "warp": 0.0, "smooth": 0.0, "ref": 0.0, "ps": 0.0,
++                   "tc": 0.0}
++        processed_frames = 0
++        if device.type == "cuda":
++            torch.cuda.reset_peak_memory_stats(device)
++        if device.type == "cuda":
++            torch.cuda.reset_peak_memory_stats(device)
+         epoch_start_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+         progress = tqdm(dataloader, desc=f"{epoch_start_time} Epoch {epoch + 1}/{args.epochs}")
+         processed_steps = 0
+@@ -329,44 +525,64 @@
+         for step, batch in enumerate(progress):
+             if args.max_steps_per_epoch is not None and step >= args.max_steps_per_epoch:
+                 break
+-            imgs = batch["imgs"].to(device, non_blocking=True)
+-            gt = batch["gt"].to(device, non_blocking=True)
+-            voxels = batch["voxels"].to(device, non_blocking=True)
+-            mask = batch["mask"].to(device, non_blocking=True)
++            # (B, K, ...) -> (B*K, ...): skip=3 windows run all 3 targets in one forward pass
++            imgs, gt, voxels, mask, t, batch_size, num_targets = flatten_targets(batch, device)
+ 
+             optimizer.zero_grad(set_to_none=True)
+             with torch.cuda.amp.autocast(enabled=args.amp):
+-                outputs = model(imgs, voxels, mask, args.bins)
+-                losses = compute_losses(outputs, gt, mask, perceptual, structural_loss, args)
++                outputs = model(imgs, voxels, mask, args.bins, t)
++                # per-target losses are means over all B*K targets, i.e. averaged per window
++                losses = compute_losses(outputs, imgs, gt, mask, perceptual, structural_loss, args)
++                losses["tc"] = compute_temporal_loss(outputs, gt, mask, batch_size, num_targets, args)
++                losses["total"] = losses["total"] + args.lambda_tc * losses["tc"]
++                if args.target_weighting == "frame":
++                    losses["total"] = losses["total"] * (num_targets / mean_targets)
+ 
+             scaler.scale(losses["total"]).backward()
+             if args.grad_clip > 0:
+                 scaler.unscale_(optimizer)
+-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
++                torch.nn.utils.clip_grad_norm_(
++                    [p for p in model.parameters() if p.requires_grad], args.grad_clip)
+             scaler.step(optimizer)
+             scaler.update()
+             scheduler.step()
+ 
+             global_step += 1
+             processed_steps += 1
++            processed_frames += batch_size * num_targets
+             for name in running:
+                 running[name] += float(losses[name].detach())
+ 
+             if global_step % args.log_interval == 0:
+-                progress.set_postfix(
+-                    loss=f"{running['total']:.4f}",
+-                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+-                )
++                shown = ("total", "rec", "syn", "warp", "ref", "ps", "tc")
++                postfix = {name: f"{running[name] / processed_steps:.4f}" for name in shown}
++                postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
++                if device.type == "cuda":
++                    postfix["mem"] = f"{torch.cuda.max_memory_allocated(device) / 2 ** 30:.2f}G"
++                if device.type == "cuda":
++                    postfix["mem"] = f"{gpu_memory_gib(device)[0]:.2f}G"
++                progress.set_postfix(postfix)
+ 
+         if processed_steps == 0:
+             raise RuntimeError("No training steps were processed")
+         means = {name: value / processed_steps for name, value in running.items()}
+-        print(
+-            f"Epoch {epoch + 1}: total={means['total']:.6f}, "
+-            f"rec={means['rec']:.6f}, syn={means['syn']:.6f}, "
+-            f"ref={means['ref']:.6f}, ps={means['ps']:.6f}"
+-        )
++        print(f"Epoch {epoch + 1} ({processed_steps} windows, {processed_frames} target frames): "
++              + ", ".join(f"{name}={value:.6f}" for name, value in means.items()))
++        if device.type == "cuda":
++            # allocated = tensors actually in use; reserved = held by PyTorch's caching allocator.
++            # nvidia-smi shows reserved + CUDA context (typically a few hundred MB more).
++            print(f"[GPU memory] stage={args.stage} crop={args.crop_size} K_max={max(batch_sampler.groups)} "
++                  f"batch={args.batch_size} amp={args.amp} | "
++                  f"peak allocated {torch.cuda.max_memory_allocated(device) / 2 ** 30:.2f} GB, "
++                  f"peak reserved {torch.cuda.max_memory_reserved(device) / 2 ** 30:.2f} GB")
++        if device.type == "cuda":
++            allocated, reserved = gpu_memory_gib(device)
++            print(f"Peak GPU memory (stage={args.stage}, crop={args.crop_size}, "
++                  f"skips={'/'.join(map(str, args.skips))}, target_mode={args.target_mode}, amp={args.amp}): "
++                  f"allocated {allocated:.2f} GiB, reserved {reserved:.2f} GiB")
+ 
++        if args.no_save:
++            continue
+         save_checkpoint(
+             output_dir,
+             "last.pth",
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/train_model.sh out/self/train_model.sh
+--- src/train_model.sh	1969-12-31 18:00:00.000000000 -0600
++++ out/self/train_model.sh	2026-11-11 23:23:11.266283668 -0600
+@@ -0,0 +1,88 @@
++#!/usr/bin/env bash
++# 分阶段训练：P1 重建(E2V) -> P2 光流+粗插帧 -> P3 端到端(纹理映射+精修)
++# 每个 skip=N 窗口同时生成全部 N 个中间时刻（--target-mode all）
++# 用法：
++#   bash train_model.sh            # 从 P1 开始依次跑完三个阶段
++#   bash train_model.sh flow       # 从 P2 开始（需要已有 P1 的 last.pth，或设置 REC_INIT）
++#   bash train_model.sh full       # 只跑 P3（需要已有 P2 的 last.pth）
++#   REC_INIT=/path/dser.pth bash train_model.sh flow   # 用 DSER++ 的 E2V 权重代替 P1
++set -euo pipefail
++cd "$(dirname "$0")"
++
++BSERGB_ROOT="/home/yuaobo/桌面/ljh/dataset/3_TRAINING"
++RAFT_CKPT="${RAFT_CKPT:-checkpoints/raft-things.pth}"   # princeton-vl/RAFT 官方权重
++REC_INIT="${REC_INIT:-}"                                # 可选：DSER++ 权重，跳过 P1
++START_STAGE="${1:-rec}"                                 # rec | flow | full
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
++
++REC_DIR="train/bsergb_rec"
++FLOW_DIR="train/bsergb_flow"
++FULL_DIR="train/bsergb_full"
++LOG_DIR="train/logs"
++mkdir -p "$LOG_DIR"
++
++# 三个阶段共用的数据与基本设置
++COMMON=(
++  --data-root "$BSERGB_ROOT"
++  --bins 8 --skips 1 3
++  --crop-size 256 --mask-patch-size 32 --beta 0.1
++  --batch-size 1 --workers 8
++  --seed 1234 --log-interval 20
++  # skip=3 的窗口一次生成 3 张（P1: 3 张灰度图；P2/P3: 3 张预测帧），skip=1 生成 1 张
++  --target-mode all --target-weighting window
++  # 同一窗口相邻目标帧之间的时间一致性（可设为 0 做消融）
++  --lambda-tc 0.1
++)
++
++case "$START_STAGE" in
++  rec|flow|full) ;;
++  *) echo "未知阶段: $START_STAGE（可选 rec / flow / full）"; exit 1 ;;
++esac
++
++# P0：冒烟测试（检查光流方向、HCS 掩码、各阶段前向/反向是否正常）
++python tools/smoke_test.py --device cpu
++
++# P1：只训练 E2V（EventRecNet），监督为 事件掩码 × 灰度 GT
++if [[ "$START_STAGE" == "rec" ]]; then
++  python train_bsergb.py "${COMMON[@]}" \
++    --stage rec \
++    --epochs 20 --lr 1e-4 --min-lr 1e-6 \
++    --output-dir "$REC_DIR" \
++    2>&1 | tee "$LOG_DIR/p1_rec.log"
++fi
++
++# P2：加载 P1（或 DSER++）+ RAFT 官方权重，冻结 E2V，训练 粗光流 + 事件修正 + 选择性融合
++if [[ "$START_STAGE" == "rec" || "$START_STAGE" == "flow" ]]; then
++  if [[ -n "$REC_INIT" ]]; then
++    FLOW_INIT=(--pretrained "$REC_INIT" --allow-partial-pretrained)
++  else
++    FLOW_INIT=(--pretrained "$REC_DIR/last.pth")
++  fi
++  [[ -f "${FLOW_INIT[1]}" ]] || { echo "找不到初始化权重: ${FLOW_INIT[1]}"; exit 1; }
++  [[ -f "$RAFT_CKPT" ]] || { echo "找不到 RAFT 权重: $RAFT_CKPT"; exit 1; }
++
++  python train_bsergb.py "${COMMON[@]}" \
++    --stage flow \
++    "${FLOW_INIT[@]}" \
++    --raft-ckpt "$RAFT_CKPT" --raft-iters 12 \
++    --freeze-rec --raft-lr-mult 0.25 \
++    --ref-mode composite --refine-iters 1 \
++    --lambda-syn 1.0 --lambda-warp 0.5 \
++    --epochs 20 --lr 1e-4 --min-lr 1e-6 \
++    --output-dir "$FLOW_DIR" \
++    2>&1 | tee "$LOG_DIR/p2_flow.log"
++fi
++
++# P3：加载 P2，端到端训练全部模块（纹理映射 + 多尺度精修），RAFT 与 E2V 用较小学习率
++[[ -f "$FLOW_DIR/last.pth" ]] || { echo "找不到 P2 权重: $FLOW_DIR/last.pth"; exit 1; }
++python train_bsergb.py "${COMMON[@]}" \
++  --stage full \
++  --pretrained "$FLOW_DIR/last.pth" \
++  --raft-iters 12 --raft-lr-mult 0.1 --rec-lr-mult 0.1 \
++  --ref-mode composite --refine-iters 1 --texture-window 3 \
++  --lambda-rec 1.0 --lambda-syn 1.0 --lambda-warp 0.5 --lambda-ref 1.0 --lambda-ps 1.0 \
++  --epochs 40 --lr 1e-4 --min-lr 1e-6 \
++  --output-dir "$FULL_DIR" \
++  2>&1 | tee "$LOG_DIR/p3_full.log"
++
++echo "训练完成：最终权重 $FULL_DIR/last.pth"
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/util/event.py out/self/util/event.py
+--- src/util/event.py	2026-01-20 15:29:40.000000000 -0600
++++ out/self/util/event.py	2026-11-11 21:27:05.341054781 -0600
+@@ -37,7 +37,7 @@
+         x=x.astype(np.uint16),
+         y=y.astype(np.uint16),
+         t=timestamp.astype(np.float32),
+-        p=polarity.astype(np.bool),
++        p=polarity.astype(bool),
+     )
+ 
+ 
+@@ -334,10 +334,10 @@
+     def to_image(self, step, background=None):
+         fea = self._features[::step]
+         polarity = fea[:, POLARITY_COLUMN] == 1
+-        x_negative = fea[~polarity, X_COLUMN].astype(np.int)
+-        y_negative = fea[~polarity, Y_COLUMN].astype(np.int)
+-        x_positive = fea[polarity, X_COLUMN].astype(np.int)
+-        y_positive = fea[polarity, Y_COLUMN].astype(np.int)
++        x_negative = fea[~polarity, X_COLUMN].astype(int)
++        y_negative = fea[~polarity, Y_COLUMN].astype(int)
++        x_positive = fea[polarity, X_COLUMN].astype(int)
++        y_positive = fea[polarity, Y_COLUMN].astype(int)
+ 
+         positive_histogram, _, _ = np.histogram2d(
+             x_positive,
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/util/utils_func.py out/self/util/utils_func.py
+--- src/util/utils_func.py	2026-01-20 15:29:40.000000000 -0600
++++ out/self/util/utils_func.py	2026-11-11 21:27:05.341756590 -0600
+@@ -163,8 +163,8 @@
+         delta_t = 1.0
+ 
+     evArray[2, :] = (channelNum) * (evArray[2, :] - first_stamp) / delta_t
+-    x = evArray[0].astype(np.int)
+-    y = evArray[1].astype(np.int)
++    x = evArray[0].astype(int)
++    y = evArray[1].astype(int)
+     # x = evArray[0]
+     # y = evArray[1]
+     ts = evArray[2]
+@@ -172,7 +172,7 @@
+     np.seterr(invalid='ignore')
+     p[p == 2] = -1
+     p[p == 0] = -1
+-    tis_c = ts.astype(np.int)
++    tis_c = ts.astype(int)
+     # tis_c = ts
+     tis_c[tis_c < 0] = 0
+     dts = ts - tis_c
+diff -ruN '--exclude=.idea' '--exclude=__pycache__' '--exclude=*.diff' src/util/voxelization.py out/self/util/voxelization.py
+--- src/util/voxelization.py	2026-01-20 15:29:40.000000000 -0600
++++ out/self/util/voxelization.py	2026-11-11 21:27:05.335658941 -0600
+@@ -6,7 +6,8 @@
+ 
+ def flatten_and_unflatten(x):
+     original_shape = x.shape
+-    return x.flatten(), partial(np.reshape, newshape=original_shape)
++    # NumPy >= 2.1 removed np.reshape(newshape=...); reshape the tensor directly instead.
++    return x.flatten(), lambda flat: flat.reshape(original_shape)
+ 
+ 
+ def _split_coordinate(c):
