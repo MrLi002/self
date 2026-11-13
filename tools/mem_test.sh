@@ -10,7 +10,6 @@
 set -uo pipefail          # 不用 -e：某个配置 OOM 时继续测下一个
 cd "$(dirname "$0")/.."
 
-#BSERGB_ROOT="${BSERGB_ROOT:-/root/autodl-tmp/3_TRAINING"
 BSERGB_ROOT="${BSERGB_ROOT:-/home/yuaobo/桌面/ljh/dataset/3_TRAINING}"
 CROPS="${CROPS:-256 384 512}"
 STAGES="${STAGES:-rec flow full}"
@@ -43,7 +42,7 @@ for stage in $STAGES; do
       --epochs 1 --max-steps-per-epoch "$STEPS" --log-interval 1 \
       --output-dir "$OUT/ckpt_${stage}_${crop}" $EXTRA > "$log" 2>&1
     status=$?
-    line=$(grep "\[GPU memory\]" "$log" | tail -1)
+    line=$(grep "\[GPU memory\]" "$log" | tail -1 | sed "s/^ *//")
     if [[ $status -ne 0 ]]; then
       if grep -qi "out of memory" "$log"; then
         line="[GPU memory] stage=$stage crop=$crop -> OOM（显存不足）"

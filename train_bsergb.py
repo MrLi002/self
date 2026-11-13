@@ -12,9 +12,18 @@ from __future__ import annotations
 import argparse
 import os
 import random
-from datetime import datetime
+import sys
+import warnings
+from itertools import islice
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
+
+# lpips builds AlexNet with the old torchvision `pretrained=` API and loads its weights with a bare
+# torch.load; both only print deprecation warnings that would break the single-line progress bar.
+warnings.filterwarnings("ignore", message=r"The parameter 'pretrained' is deprecated", category=UserWarning)
+warnings.filterwarnings("ignore", message=r"Arguments other than a weight enum", category=UserWarning)
+warnings.filterwarnings("ignore", message=r"You are using `torch.load` with `weights_only=False`",
+                        category=FutureWarning)
 
 import numpy as np
 import torch
@@ -371,6 +380,31 @@ def gpu_memory_gib(device: torch.device) -> Tuple[float, float]:
             torch.cuda.max_memory_reserved(device) / 2 ** 30)
 
 
+def progress_bar_kwargs() -> dict:
+    """tqdm settings that keep exactly one progress line per epoch.
+
+    A refresh is "carriage return + redraw". If the line is wider than the terminal it wraps, the
+    carriage return only rewinds the last wrapped row, and every refresh leaves a new row behind.
+    So the postfix is kept short and the bar always knows the width it may use.
+    """
+    if sys.stderr.isatty():
+        return {"dynamic_ncols": True}                       # terminal: follow its width, also on resize
+    try:
+        # stderr is piped (e.g. `2>&1 | tee log`) but someone still watches it in a terminal
+        return {"ncols": os.get_terminal_size(sys.stdin.fileno()).columns, "mininterval": 1.0}
+    except (OSError, ValueError, AttributeError):
+        return {"ncols": 150, "mininterval": 60.0}           # plain file / nohup: refresh once a minute
+
+
+def same_stream(first, second) -> bool:
+    """True if two streams end up in the same terminal, file or pipe (e.g. `> log 2>&1`)."""
+    try:
+        a, b = os.fstat(first.fileno()), os.fstat(second.fileno())
+    except (OSError, ValueError, AttributeError):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
 def save_checkpoint(
     output_dir: Path,
     filename: str,
@@ -499,7 +533,7 @@ def train(args: argparse.Namespace) -> None:
             raise RuntimeError("--data-parallel requires at least two visible CUDA devices")
         model = torch.nn.DataParallel(model)
 
-    perceptual = lpips.LPIPS(net="alex").to(device).eval()
+    perceptual = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
     for parameter in perceptual.parameters():
         parameter.requires_grad_(False)
     structural_loss = MaskedSSIMLoss(window_size=11).to(device)
@@ -510,6 +544,10 @@ def train(args: argparse.Namespace) -> None:
         f"trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
     )
     output_dir = Path(args.output_dir)
+    bar_kwargs = progress_bar_kwargs()
+    # With `python train_bsergb.py ... > log` the live bar stays in the terminal (stderr) and the
+    # finished bar line of every epoch is also written to the log (stdout).
+    copy_bar_to_stdout = not sys.stdout.isatty() and not same_stream(sys.stdout, sys.stderr)
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -518,15 +556,13 @@ def train(args: argparse.Namespace) -> None:
         processed_frames = 0
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-        epoch_start_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-        progress = tqdm(dataloader, desc=f"{epoch_start_time} Epoch {epoch + 1}/{args.epochs}")
+        # One bar per epoch, e.g.
+        # Train Epoch(0/20): 100%|████| 16984/16984 [4:40:32<00:00, 1.01it/s, sum_loss=897.4082, learn_rate=0.000099]
+        progress = tqdm(islice(dataloader, steps_per_epoch), total=steps_per_epoch,
+                        desc=f"Train Epoch({epoch}/{args.epochs})", **bar_kwargs)
         processed_steps = 0
 
         for step, batch in enumerate(progress):
-            if args.max_steps_per_epoch is not None and step >= args.max_steps_per_epoch:
-                break
             # (B, K, ...) -> (B*K, ...): skip=3 windows run all 3 targets in one forward pass
             imgs, gt, voxels, mask, t, batch_size, num_targets = flatten_targets(batch, device)
 
@@ -555,33 +591,29 @@ def train(args: argparse.Namespace) -> None:
             for name in running:
                 running[name] += float(losses[name].detach())
 
-            if global_step % args.log_interval == 0:
-                shown = ("total", "rec", "syn", "warp", "ref", "ps", "tc")
-                postfix = {name: f"{running[name] / processed_steps:.4f}" for name in shown}
-                postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
-                if device.type == "cuda":
-                    postfix["mem"] = f"{torch.cuda.max_memory_allocated(device) / 2 ** 30:.2f}G"
-                if device.type == "cuda":
-                    postfix["mem"] = f"{gpu_memory_gib(device)[0]:.2f}G"
-                progress.set_postfix(postfix)
+            if global_step % args.log_interval == 0 or step + 1 == steps_per_epoch:
+                # sum_loss = running sum of the total loss over this epoch (as in OF-AF's log)
+                # (a dict keeps this order; keyword arguments would be sorted alphabetically by tqdm)
+                progress.set_postfix({"sum_loss": f"{running['total']:.4f}",
+                                      "learn_rate": f"{optimizer.param_groups[0]['lr']:.6f}"}, refresh=False)
 
+        bar_line = str(progress)
+        progress.close()
         if processed_steps == 0:
             raise RuntimeError("No training steps were processed")
+        if copy_bar_to_stdout:
+            print(bar_line)
+        # Details below go to stdout only (the log file when train_model.sh is used).
         means = {name: value / processed_steps for name, value in running.items()}
-        print(f"Epoch {epoch + 1} ({processed_steps} windows, {processed_frames} target frames): "
+        print(f"  mean over {processed_steps} windows / {processed_frames} target frames: "
               + ", ".join(f"{name}={value:.6f}" for name, value in means.items()))
         if device.type == "cuda":
             # allocated = tensors actually in use; reserved = held by PyTorch's caching allocator.
             # nvidia-smi shows reserved + CUDA context (typically a few hundred MB more).
-            print(f"[GPU memory] stage={args.stage} crop={args.crop_size} K_max={max(batch_sampler.groups)} "
-                  f"batch={args.batch_size} amp={args.amp} | "
-                  f"peak allocated {torch.cuda.max_memory_allocated(device) / 2 ** 30:.2f} GB, "
-                  f"peak reserved {torch.cuda.max_memory_reserved(device) / 2 ** 30:.2f} GB")
-        if device.type == "cuda":
             allocated, reserved = gpu_memory_gib(device)
-            print(f"Peak GPU memory (stage={args.stage}, crop={args.crop_size}, "
-                  f"skips={'/'.join(map(str, args.skips))}, target_mode={args.target_mode}, amp={args.amp}): "
-                  f"allocated {allocated:.2f} GiB, reserved {reserved:.2f} GiB")
+            print(f"  [GPU memory] stage={args.stage} crop={args.crop_size} K_max={max(batch_sampler.groups)} "
+                  f"batch={args.batch_size} amp={args.amp} | "
+                  f"peak allocated {allocated:.2f} GB, peak reserved {reserved:.2f} GB")
 
         if args.no_save:
             continue
@@ -612,4 +644,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
+    # stdout redirected to a log file is block-buffered by default: flush every line instead
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     train(parse_args())
