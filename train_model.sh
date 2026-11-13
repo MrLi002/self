@@ -9,6 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+#BSERGB_ROOT="/root/autodl-tmp/3_TRAINING"
 BSERGB_ROOT="/home/yuaobo/桌面/ljh/dataset/3_TRAINING"
 RAFT_CKPT="${RAFT_CKPT:-checkpoints/raft-things.pth}"   # princeton-vl/RAFT 官方权重
 REC_INIT="${REC_INIT:-}"                                # 可选：DSER++ 权重，跳过 P1
@@ -25,7 +26,7 @@ mkdir -p "$LOG_DIR"
 COMMON=(
   --data-root "$BSERGB_ROOT"
   --bins 8 --skips 1 3
-  --crop-size 256 --mask-patch-size 32 --beta 0.1
+  --crop-size 448 --mask-patch-size 32 --beta 0.1
   --batch-size 1 --workers 8
   --seed 1234 --log-interval 20
   # skip=3 的窗口一次生成 3 张（P1: 3 张灰度图；P2/P3: 3 张预测帧），skip=1 生成 1 张

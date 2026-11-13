@@ -10,6 +10,7 @@
 set -uo pipefail          # 不用 -e：某个配置 OOM 时继续测下一个
 cd "$(dirname "$0")/.."
 
+#BSERGB_ROOT="${BSERGB_ROOT:-/root/autodl-tmp/3_TRAINING"
 BSERGB_ROOT="${BSERGB_ROOT:-/home/yuaobo/桌面/ljh/dataset/3_TRAINING}"
 CROPS="${CROPS:-256 384 512}"
 STAGES="${STAGES:-rec flow full}"

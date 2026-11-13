@@ -254,8 +254,7 @@ class BSERGBTrainDataset(Dataset):
         return top, left, top + self.crop_height, left + self.crop_width
 
     @staticmethod
-    def _apply_spatial_transform(tensors: Sequence[torch.Tensor], vertical_flip: bool,
-                                 horizontal_flip: bool, rotations: int) -> List[torch.Tensor]:
+    def _apply_spatial_transform(tensors: Sequence[torch.Tensor], vertical_flip: bool, horizontal_flip: bool, rotations: int) -> List[torch.Tensor]:
         """Apply the same flip/rotation to every tensor (any rank, spatial dims last)."""
         out = []
         for tensor in tensors:
